@@ -5,7 +5,7 @@ A single-file Blender extension (`mho_fbx_to_actions/__init__.py` +
 `blender_manifest.toml`) called **"MHO Actions"**, built for a game-modding
 pipeline (Marvel Heroes Omega project, character `drstrange_classicvu`).
 Targets Blender 5.0+, developed/tested on **Blender 5.1**.
-Current version: **1.50.0**. Installed via drag-drop onto Blender or
+Current version: **1.51.0**. Installed via drag-drop onto Blender or
 Get Extensions > Install from Disk.
 
 There is no build step, no external deps, no tests directory — it's one
@@ -75,15 +75,21 @@ to produce the installable package at
     Export Animations.
 11. **Texture Baker** — per-object/per-selected-faces atlas baking,
     smart UV unwrap, Data Transfer projection.
-    - *Bake Top-Down (Flat)* (1.50.0): bakes all selected meshes together,
-      seen straight down, onto one flat square quad (a ground-plane
-      texture for the MHO-UPK-Tools `--ground-box` planes). Selected-to-
-      active from a quad just above the top, zero cage extrusion, so rays
-      go straight down (-Z). Same four channels/sizes as the atlas bake,
-      saved as `<active>_TopDown_D.png` etc. The quad ends at the lowest
-      point with the merged material; custom props `mho_top_down_min_xy`
-      / `_max_xy` / `_z_range` record the covered area (UV 0,0 = min X/Y
-      corner, image up = +Y). Misses bake black.
+    - *Bake Top-Down (Flat)* (1.50.0, reworked 1.51.0): bakes all selected
+      meshes together, seen straight down, onto one single-face quad
+      fitted to their exact X/Y bounds (Kurt's workflow: import the zone
+      ground mesh, bake, import the quad into the game as a simple
+      one-face ground plane). Selected-to-active from a quad just above
+      the top, zero cage extrusion, so rays go straight down (-Z). Same
+      four channels as the atlas bake, saved as `<active>_TopDown_D.png`
+      etc.; the long side uses the chosen size, the short side is scaled
+      and rounded UP to a power of two. An extra no-margin coverage pass
+      (all sources emit white) becomes the **Diffuse alpha**, so empty
+      areas are transparent while colour still bleeds under the edge
+      (margin). The quad ends at the lowest point with the merged
+      material (Diffuse alpha wired to BSDF Alpha); custom props
+      `mho_top_down_min_xy` / `_max_xy` / `_z_range` record the covered
+      area (UV 0,0 = min X/Y corner, image up = +Y).
 
 ## Recent changes (this session, chronological)
 - **Batch Export Animations frame-range fix — attempted, then reverted.**

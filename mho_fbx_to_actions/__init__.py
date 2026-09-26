@@ -102,12 +102,14 @@ Includes:
      assigned to each new "<object>_Atlas" object - the source
      objects are left untouched. "Bake Top-Down (Flat)" instead bakes
      every selected mesh together, as seen straight down from above,
-     onto one flat square quad covering their footprint (a ground
-     plane texture): selected-to-active from a quad just above the
-     highest point, rays cast straight down. Same four channels and
-     sizes, saved as "<active>_TopDown_D.png" etc.; the quad ends up
-     at the lowest point with the merged material, and its world X/Y
-     extents are stored as custom properties on it.
+     onto one single-face quad fitted to their X/Y bounds (a ground
+     plane): selected-to-active from a quad just above the highest
+     point, rays cast straight down. Same four channels, saved as
+     "<active>_TopDown_D.png" etc., sized to the quad's aspect (short
+     side rounded up to a power of two); Diffuse alpha is transparent
+     wherever there's no geometry below. The quad ends up at the
+     lowest point with the merged material, and its world X/Y extents
+     are stored as custom properties on it.
   10. Weight Smooth: runs Vertex Group Smooth across every vertex
       group on the active mesh, any time - not tied to a Weight
       Transfer. With "Selected Vertices Only" on, only vertices
@@ -178,7 +180,7 @@ from bpy.types import Operator, Panel, PropertyGroup
 # Keep this in sync with blender_manifest.toml's version every release -
 # shown in the MHO Prepare Viewport panel so it's easy to confirm which
 # build is actually installed (vs. a stale cached zip).
-MHO_ADDON_VERSION = "1.50.0"
+MHO_ADDON_VERSION = "1.51.0"
 
 
 # ---------------------------------------------------------------------
@@ -3718,8 +3720,10 @@ def _tb_make_single_user_materials(target_obj):
             target_obj.material_slots[i].material = slot.material.copy()
 
 
-def _tb_new_atlas_image(name, size, channel):
-    img = bpy.data.images.new(name=name, width=size, height=size, alpha=False)
+def _tb_new_atlas_image(name, size, channel, height=None, alpha=False):
+    img = bpy.data.images.new(
+        name=name, width=size, height=size if height is None else height, alpha=alpha
+    )
     img.colorspace_settings.name = _TB_COLORSPACE[channel]
     return img
 
@@ -3783,6 +3787,33 @@ def _tb_add_emit_overrides(obj, channel):
             links.new(source_node.outputs["Color"], emission.inputs["Color"])
             temp_nodes.append((mat, source_node))
 
+    return temp_nodes
+
+
+def _tb_add_coverage_overrides(obj):
+    """Like _tb_add_emit_overrides, but every material emits plain white -
+    baking this gives a mask of where the geometry is at all. Only ever
+    call this on single-user material copies."""
+
+    temp_nodes = []
+    for mat in {s.material for s in obj.material_slots if s.material}:
+        if not mat.use_nodes:
+            mat.use_nodes = True
+        nodes = mat.node_tree.nodes
+
+        output_node = None
+        for n in nodes:
+            if n.type == "OUTPUT_MATERIAL" and n.is_active_output:
+                output_node = n
+                break
+        if output_node is None:
+            output_node = nodes.new("ShaderNodeOutputMaterial")
+
+        emission = nodes.new("ShaderNodeEmission")
+        emission.name = "TB_Coverage"
+        emission.inputs["Color"].default_value = (1.0, 1.0, 1.0, 1.0)
+        mat.node_tree.links.new(emission.outputs["Emission"], output_node.inputs["Surface"])
+        temp_nodes.append((mat, emission))
     return temp_nodes
 
 
@@ -3966,16 +3997,16 @@ def _tb_world_bounds(context, obj):
     return lo, hi
 
 
-def _tb_new_top_down_plane(name, center_x, center_y, z, side, collection):
-    """A single square quad, normal +Z, centred on (center_x, center_y) at
-    height z, with UV (0,0) at its min-X/min-Y corner and (1,1) at its
-    max-X/max-Y corner - so the baked image reads as a plain top-down
-    map (image up = world +Y)."""
+def _tb_new_top_down_plane(name, center_x, center_y, z, size_x, size_y, collection):
+    """A single rectangular quad, normal +Z, centred on (center_x,
+    center_y) at height z, with UV (0,0) at its min-X/min-Y corner and
+    (1,1) at its max-X/max-Y corner - so the baked image reads as a
+    plain top-down map (image up = world +Y)."""
 
-    half = side / 2.0
+    hx, hy = size_x / 2.0, size_y / 2.0
     mesh = bpy.data.meshes.new(name)
     mesh.from_pydata(
-        [(-half, -half, 0.0), (half, -half, 0.0), (half, half, 0.0), (-half, half, 0.0)],
+        [(-hx, -hy, 0.0), (hx, -hy, 0.0), (hx, hy, 0.0), (-hx, hy, 0.0)],
         [],
         [(0, 1, 2, 3)],
     )
@@ -3990,25 +4021,60 @@ def _tb_new_top_down_plane(name, center_x, center_y, z, side, collection):
     return obj
 
 
+def _tb_top_down_image_dims(size, size_x, size_y):
+    """(width, height) for a top-down image over a size_x by size_y area:
+    the longer side gets the chosen size, the shorter side is scaled to
+    match and rounded UP to a power of two (game textures must be), so
+    texels are never coarser than the chosen size along either axis."""
+
+    long_side = max(size_x, size_y)
+    short_px = size * min(size_x, size_y) / long_side
+    pow2 = 4
+    while pow2 < short_px and pow2 < size:
+        pow2 *= 2
+    return (size, pow2) if size_x >= size_y else (pow2, size)
+
+
+def _tb_apply_coverage_alpha(image, coverage):
+    """Replace image's alpha with coverage's red channel (same size)."""
+
+    import numpy as np
+
+    count = image.size[0] * image.size[1] * 4
+    pixels = np.empty(count, dtype=np.float32)
+    image.pixels.foreach_get(pixels)
+    mask = np.empty(count, dtype=np.float32)
+    coverage.pixels.foreach_get(mask)
+    pixels[3::4] = mask[0::4]
+    image.pixels.foreach_set(pixels)
+    image.update()
+
+
 def texture_bake_top_down_run(context, source_objs, props, base_name, output_dir):
     """Orthographic top-down bake of every source mesh together onto one
-    flat square quad - for a ground plane standing in for a whole area.
+    flat quad - a single-face ground plane standing in for a whole area.
 
     The sources are duplicated and joined (optionally trimmed to their
     selected faces), and their materials made single-user, exactly as
-    the atlas bake does. A square quad covering the joined footprint
-    (the longer of its X/Y extents, centred) is placed just above the
-    highest point, and Cycles bakes selected-to-active from it: with
-    zero cage extrusion, each ray starts on the quad and travels
-    straight down (-Z), so every texel records the first surface it
-    hits from above. Rays that hit nothing leave black, filled in at
-    the edges by the bake margin.
+    the atlas bake does. A quad matching the joined footprint's exact
+    X/Y bounds is placed just above the highest point, and Cycles bakes
+    selected-to-active from it: with zero cage extrusion, each ray
+    starts on the quad and travels straight down (-Z), so every texel
+    records the first surface it hits from above. Image sizes follow
+    the quad's aspect (_tb_top_down_image_dims).
+
+    An extra coverage pass (every source emitting white, no margin)
+    marks which texels hit geometry at all; it becomes the Diffuse
+    image's alpha, so empty areas are transparent. Diffuse's colour
+    still bleeds out by the bake margin under the transparent edge,
+    which keeps mipmaps from fringing dark.
 
     Afterwards the quad drops to the lowest point of the sources, gets
-    one merged material (via apply_shader_slot_maps), and records its
-    world X/Y extents as custom properties; the joined duplicate is
-    deleted. Returns (plane_obj, saved_paths, log), or raises
-    RuntimeError with a user-facing message on failure."""
+    one merged material (via apply_shader_slot_maps, with Diffuse alpha
+    wired to the BSDF), and records its world X/Y extents as custom
+    properties; the joined duplicate is deleted. Returns (plane_obj,
+    saved_paths, log), or raises RuntimeError with a user-facing
+    message on failure."""
 
     log = []
     margin = 8
@@ -4028,18 +4094,23 @@ def texture_bake_top_down_run(context, source_objs, props, base_name, output_dir
         if source_uv is not None:
             source_uv.active_render = True
         _tb_make_single_user_materials(source_dup)
+        if len(source_dup.material_slots) == 0:
+            # The emit/coverage overrides live in materials - with none at
+            # all, nothing would emit and the whole bake would come out
+            # empty. A blank one still bakes coverage (and black colour).
+            source_dup.data.materials.append(bpy.data.materials.new(name="TB_Blank"))
 
         lo, hi = _tb_world_bounds(context, source_dup)
-        side = max(hi.x - lo.x, hi.y - lo.y)
-        if side <= 0.0:
-            raise RuntimeError("Selection has no footprint from above (zero X/Y size)")
+        size_x, size_y = hi.x - lo.x, hi.y - lo.y
+        if size_x <= 0.0 or size_y <= 0.0:
+            raise RuntimeError("Selection has no area from above (zero X or Y size)")
         center_x = (lo.x + hi.x) / 2.0
         center_y = (lo.y + hi.y) / 2.0
         height = hi.z - lo.z
-        pad = max(side, height) * 0.01 + 0.001
+        pad = max(size_x, size_y, height) * 0.01 + 0.001
 
         plane = _tb_new_top_down_plane(
-            f"{base_name}", center_x, center_y, hi.z + pad, side,
+            f"{base_name}", center_x, center_y, hi.z + pad, size_x, size_y,
             source_objs[0].users_collection[0],
         )
         # Temporary material only to hold the TB_Target node - with
@@ -4066,18 +4137,21 @@ def texture_bake_top_down_run(context, source_objs, props, base_name, output_dir
             use_clear=True,
         )
 
-        sizes = {
-            "diffuse": int(props.tb_diffuse_size),
-            "normal": int(props.tb_normal_size),
-            "specmask": int(props.tb_specmask_size),
-            "speccolor": int(props.tb_speccolor_size),
+        dims = {
+            channel: _tb_top_down_image_dims(int(getattr(props, prop)), size_x, size_y)
+            for channel, prop in (
+                ("diffuse", "tb_diffuse_size"),
+                ("normal", "tb_normal_size"),
+                ("specmask", "tb_specmask_size"),
+                ("speccolor", "tb_speccolor_size"),
+            )
         }
         images = {}
 
         # Normal first, while the sources' real Normal Map setups are
         # still intact (the emit passes below override their outputs).
-        size = sizes["normal"]
-        img = _tb_new_atlas_image(f"{base_name}_{_TB_LABEL['normal']}", size, "normal")
+        w, h = dims["normal"]
+        img = _tb_new_atlas_image(f"{base_name}_{_TB_LABEL['normal']}", w, "normal", height=h)
         temp_nodes = _tb_add_target_nodes(plane, img)
         bpy.ops.object.bake(
             type="NORMAL",
@@ -4089,17 +4163,32 @@ def texture_bake_top_down_run(context, source_objs, props, base_name, output_dir
         )
         _tb_remove_temp_nodes(temp_nodes)
         images["normal"] = img
-        log.append(f"OK    baked top-down Normal at {size}x{size}")
+        log.append(f"OK    baked top-down Normal at {w}x{h}")
 
         for channel in ("diffuse", "specmask", "speccolor"):
-            size = sizes[channel]
-            img = _tb_new_atlas_image(f"{base_name}_{_TB_LABEL[channel]}", size, channel)
+            w, h = dims[channel]
+            img = _tb_new_atlas_image(
+                f"{base_name}_{_TB_LABEL[channel]}", w, channel, height=h,
+                alpha=(channel == "diffuse"),
+            )
             temp_nodes = _tb_add_emit_overrides(source_dup, channel)
             temp_nodes += _tb_add_target_nodes(plane, img)
             bpy.ops.object.bake(type="EMIT", **ray_kwargs)
             _tb_remove_temp_nodes(temp_nodes)
             images[channel] = img
-            log.append(f"OK    baked top-down {_TB_LABEL[channel]} at {size}x{size}")
+            log.append(f"OK    baked top-down {_TB_LABEL[channel]} at {w}x{h}")
+
+        # Coverage mask -> Diffuse alpha. No margin here: texels that
+        # missed the geometry must stay exactly 0.
+        w, h = dims["diffuse"]
+        coverage = bpy.data.images.new(name="TB_Coverage", width=w, height=h, alpha=False)
+        temp_nodes = _tb_add_coverage_overrides(source_dup)
+        temp_nodes += _tb_add_target_nodes(plane, coverage)
+        bpy.ops.object.bake(type="EMIT", **dict(ray_kwargs, margin=0))
+        _tb_remove_temp_nodes(temp_nodes)
+        _tb_apply_coverage_alpha(images["diffuse"], coverage)
+        bpy.data.images.remove(coverage)
+        log.append("OK    Diffuse alpha = top-down coverage (empty areas transparent)")
 
         succeeded = True
     finally:
@@ -4127,22 +4216,26 @@ def texture_bake_top_down_run(context, source_objs, props, base_name, output_dir
     merged_mat.ssm_specular_image = images.get("specmask")
     merged_mat.ssm_speccolor_image = images.get("speccolor")
     apply_shader_slot_maps(merged_mat)
+    # Show the cut-out in the viewport too: Diffuse alpha -> BSDF Alpha.
+    diff_node = merged_mat.node_tree.nodes.get("SlotMap_Diffuse")
+    bsdf = _ssm_find_principled_bsdf(merged_mat.node_tree.nodes)
+    if diff_node is not None and bsdf is not None:
+        merged_mat.node_tree.links.new(diff_node.outputs["Alpha"], bsdf.inputs["Alpha"])
     plane.data.materials.clear()
     plane.data.materials.append(merged_mat)
 
     # Sit the finished quad at the bottom of the baked area, like a ground
     # plane, and record exactly what area the image covers.
     plane.location.z = lo.z
-    half = side / 2.0
-    plane["mho_top_down_min_xy"] = (center_x - half, center_y - half)
-    plane["mho_top_down_max_xy"] = (center_x + half, center_y + half)
+    plane["mho_top_down_min_xy"] = (lo.x, lo.y)
+    plane["mho_top_down_max_xy"] = (hi.x, hi.y)
     plane["mho_top_down_z_range"] = (lo.z, hi.z)
 
     purge_orphan_data()
 
     log.append(
-        f"OK    '{plane.name}' covers X {center_x - half:.3f}..{center_x + half:.3f}, "
-        f"Y {center_y - half:.3f}..{center_y + half:.3f} (side {side:.3f}), at Z {lo.z:.3f}"
+        f"OK    '{plane.name}' covers X {lo.x:.3f}..{hi.x:.3f}, Y {lo.y:.3f}..{hi.y:.3f} "
+        f"({size_x:.3f} x {size_y:.3f}), at Z {lo.z:.3f}"
     )
     return plane, saved_paths, log
 
@@ -4226,16 +4319,17 @@ class MHO_OT_texture_bake(Operator):
 
 class MHO_OT_texture_bake_top_down(Operator):
     """Bake a straight-down orthographic view of all selected meshes
-    together onto one flat square quad - a ground plane texture"""
+    together onto one flat quad fitted to their bounds - a single-face
+    ground plane, transparent wherever there's no geometry"""
 
     bl_idname = "mho.texture_bake_top_down"
     bl_label = "Bake Top-Down (Flat)"
     bl_description = (
         "Bake all selected meshes together as seen straight down from above onto one flat "
-        "square quad covering their footprint: Diffuse/Normal/Spec Mask/Spec Color PNGs go in "
-        "a 'textures' subfolder next to this .blend, and the quad is left at the lowest point "
-        "with the merged material. Its X/Y extents are stored as custom properties - the "
-        "originals are left untouched"
+        "quad fitted to their X/Y bounds: Diffuse/Normal/Spec Mask/Spec Color PNGs go in a "
+        "'textures' subfolder next to this .blend, with Diffuse alpha transparent wherever "
+        "there's no geometry. The quad is left at the lowest point with the merged material, "
+        "and its X/Y extents are stored as custom properties - the originals are left untouched"
     )
     bl_options = {"REGISTER", "UNDO"}
 
