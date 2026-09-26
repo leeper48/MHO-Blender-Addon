@@ -1,0 +1,23 @@
+schema_version = "1.0.0"
+
+id = "mho_fbx_to_actions"
+version = "1.49.1"
+name = "MHO Actions"
+tagline = "MHO tools: batch FBX-to-Action import, action-library-to-NLA, viewport prep, weight transfer, weight smooth, vgroup mirror-name renaming, position-based weight mirroring, model prep, symmetrical sculpt adjust, shader slot maps, FBX export for game, batch animation export, and texture atlas baking"
+maintainer = "Kurt <you@example.com>"
+type = "add-on"
+
+# Bump this if you support older Blender versions too; 5.0.0 is the floor here.
+blender_version_min = "5.0.0"
+
+license = ["SPDX:GPL-3.0-or-later"]
+
+tags = ["Animation", "Import-Export", "Rigging"]
+
+# This addon reads FBX files and action-library .blend files from disk, saves
+# an output .blend file, exports a game-ready FBX next to the current .blend,
+# exports per-animation FBXs into a "Blend_anims" subfolder next to the
+# current .blend, and saves baked texture atlas PNGs into a "textures"
+# subfolder next to the current .blend, so it needs the "files" permission.
+[permissions]
+files = "Import FBX animation exports, append actions from a library .blend, save the resulting action library .blend file, export a game-ready FBX next to the current .blend, export per-animation FBXs into a Blend_anims subfolder next to the current .blend, and save baked texture atlas PNGs into a textures subfolder next to the current .blend"
