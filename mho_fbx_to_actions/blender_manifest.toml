@@ -1,7 +1,7 @@
 schema_version = "1.0.0"
 
 id = "mho_fbx_to_actions"
-version = "1.52.0"
+version = "1.53.0"
 name = "MHO Actions"
 tagline = "MHO tools: batch FBX-to-Action import, action-library-to-NLA, viewport prep, weight transfer, weight smooth, vgroup mirror-name renaming, position-based weight mirroring, model prep, symmetrical sculpt adjust, shader slot maps, FBX export for game, batch animation export, texture atlas baking, and top-down ground-plane baking"
 maintainer = "Kurt <you@example.com>"

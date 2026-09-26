@@ -5,7 +5,7 @@ A single-file Blender extension (`mho_fbx_to_actions/__init__.py` +
 `blender_manifest.toml`) called **"MHO Actions"**, built for a game-modding
 pipeline (Marvel Heroes Omega project, character `drstrange_classicvu`).
 Targets Blender 5.0+, developed/tested on **Blender 5.1**.
-Current version: **1.52.0**. Installed via drag-drop onto Blender or
+Current version: **1.53.0**. Installed via drag-drop onto Blender or
 Get Extensions > Install from Disk.
 
 There is no build step, no external deps, no tests directory — it's one
@@ -87,11 +87,22 @@ to produce the installable package at
       extrusion / max ray distance come from the measured high↔low
       nearest-surface gap (BVH, world space, both directions). Output
       `<object>_Reduced_*.png` on `<object>_Reduced_Atlas`.
-    - Emit-channel sources: an `ssm_*` image if set; otherwise Diffuse
-      falls back to whatever feeds the Principled Base Color (FBX-import
-      materials work without Detect) and other channels bake **black**.
-      The Emission node defaults to white - always set its colour (this
-      caused an all-white Diffuse bug before 1.51.1).
+    - Emit-channel sources (1.53.0, all bakes), in priority order:
+      (1) what's actually connected in the material's graph, read at the
+      rendering Principled BSDF (the first one upstream of the active
+      output, so through Mix Shaders): Base Color → Diffuse, Specular
+      Tint → Spec Color, and for Spec Mask the colour going INTO the
+      Separate Color node behind Roughness/Metallic/Specular (the
+      individual remapped sockets can't be reassembled into a mask);
+      (2) the `ssm_*` image; (3) Diffuse = Base Color value, others
+      **black**. Normal bakes the real shading; if a material's Normal
+      is unconnected but it has `ssm_normal_image`, that's wired in
+      through a temp Normal Map node for the bake. The Emission node
+      defaults to white - always set its colour (this caused an
+      all-white Diffuse bug before 1.51.1).
+    - Testing gotcha: an in-memory (generated, unsaved) image loses its
+      pixel edits whenever its colour space changes - fill test images'
+      pixels after node setup and `pack()` them.
     - *Bake Top-Down (Flat)* (1.50.0, reworked 1.51.0): bakes all selected
       meshes together, seen straight down, onto one single-face quad
       fitted to their exact X/Y bounds (Kurt's workflow: import the zone

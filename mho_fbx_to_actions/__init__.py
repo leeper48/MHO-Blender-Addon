@@ -187,7 +187,7 @@ from bpy.types import Operator, Panel, PropertyGroup
 # Keep this in sync with blender_manifest.toml's version every release -
 # shown in the MHO Prepare Viewport panel so it's easy to confirm which
 # build is actually installed (vs. a stale cached zip).
-MHO_ADDON_VERSION = "1.52.0"
+MHO_ADDON_VERSION = "1.53.0"
 
 
 # ---------------------------------------------------------------------
@@ -3773,42 +3773,99 @@ def _tb_add_target_nodes(obj, image):
     return temp_nodes
 
 
-def _tb_base_color_source(mat):
-    """Fallback Diffuse source for a material with no ssm_diffuse_image
-    (e.g. straight out of FBX import): the first Image Texture found
-    upstream of the Principled BSDF's Base Color, else that socket's
-    plain colour value. Returns (image or None, rgba or None)."""
+def _tb_active_output(nodes, create=False):
+    for n in nodes:
+        if n.type == "OUTPUT_MATERIAL" and n.is_active_output:
+            return n
+    return nodes.new("ShaderNodeOutputMaterial") if create else None
 
-    bsdf = _ssm_find_principled_bsdf(mat.node_tree.nodes)
-    if bsdf is None:
-        return None, None
-    base = bsdf.inputs["Base Color"]
-    if not base.is_linked:
-        return None, tuple(base.default_value)
 
-    stack = [base.links[0].from_node]
+def _tb_upstream_nodes(socket):
+    """Every node upstream of an input socket (depth-first, each once)."""
+
+    stack = [link.from_node for link in socket.links if not link.is_muted]
     seen = set()
     while stack:
         node = stack.pop()
         if node.name in seen:
             continue
         seen.add(node.name)
-        if node.type == "TEX_IMAGE" and node.image is not None:
-            return node.image, None
+        yield node
         for inp in node.inputs:
-            stack.extend(link.from_node for link in inp.links)
-    return None, None
+            stack.extend(link.from_node for link in inp.links if not link.is_muted)
+
+
+def _tb_bake_bsdf(mat):
+    """The Principled BSDF this material actually renders with: the first
+    one upstream of the active output's Surface (so it goes through Mix
+    Shaders etc.), else any Principled BSDF in the tree."""
+
+    nodes = mat.node_tree.nodes
+    output = _tb_active_output(nodes)
+    if output is not None:
+        for node in _tb_upstream_nodes(output.inputs["Surface"]):
+            if node.type == "BSDF_PRINCIPLED":
+                return node
+    return _ssm_find_principled_bsdf(nodes)
+
+
+def _tb_linked_output(socket):
+    """The output socket feeding an input socket, or None if unconnected."""
+
+    if socket is None:
+        return None
+    for link in socket.links:
+        if not link.is_muted:
+            return link.from_socket
+    return None
+
+
+def _tb_channel_source_socket(mat, channel):
+    """The node output in mat's own graph that holds this channel's final
+    value, if something is connected - read straight from what the
+    Principled BSDF is actually fed, so tints/mixes/etc. are kept:
+    - diffuse:   whatever feeds Base Color
+    - speccolor: whatever feeds Specular Tint
+    - specmask:  the combined mask colour going INTO the Separate Color
+                 node that drives Roughness / Metallic / Specular (the
+                 layout Shader Slot Maps builds, and the usual one for a
+                 packed mask texture) - the individual sockets can't be
+                 reassembled into a mask, since they're remapped.
+    Returns None when nothing is connected (normal isn't handled here -
+    the NORMAL bake already reads real shading)."""
+
+    bsdf = _tb_bake_bsdf(mat)
+    if bsdf is None:
+        return None
+
+    if channel == "diffuse":
+        return _tb_linked_output(bsdf.inputs.get("Base Color"))
+    if channel == "speccolor":
+        return _tb_linked_output(bsdf.inputs.get("Specular Tint"))
+    if channel == "specmask":
+        for name in ("Roughness", "Metallic", "Specular IOR Level", "Specular"):
+            socket = bsdf.inputs.get(name)
+            if socket is None or not socket.is_linked:
+                continue
+            for node in _tb_upstream_nodes(socket):
+                if node.type in ("SEPARATE_COLOR", "SEPRGB"):
+                    mask = _tb_linked_output(node.inputs[0])
+                    if mask is not None:
+                        return mask
+    return None
 
 
 def _tb_add_emit_overrides(obj, channel):
     """Wire a temporary Emission shader into the active output of every
-    material on obj, fed by that material's ssm_* source image for this
-    channel. With no ssm_* image, Diffuse falls back to whatever feeds
-    the Principled Base Color (_tb_base_color_source); anything else
-    emits black. (The Emission node's own default colour is WHITE, so
-    it must always be set explicitly.) Only ever call this on
-    single-user material copies - it replaces the Surface link.
-    Returns [(mat, node), ...] for _tb_remove_temp_nodes."""
+    material on obj, emitting this channel's value. Source, in order:
+    1. whatever is connected in the material's own graph
+       (_tb_channel_source_socket) - the final value the BSDF receives;
+    2. the material's ssm_* image for this channel;
+    3. Diffuse: the Base Color's plain colour; anything else: black.
+    (The Emission node's own default colour is WHITE, so it must always
+    be set explicitly.) Only ever call this on single-user material
+    copies - it replaces the Surface link. Returns [(mat, node), ...]
+    for _tb_remove_temp_nodes."""
 
     ssm_attr = _TB_SSM_ATTR[channel]
     temp_nodes = []
@@ -3819,27 +3876,27 @@ def _tb_add_emit_overrides(obj, channel):
         nodes = mat.node_tree.nodes
         links = mat.node_tree.links
 
-        output_node = None
-        for n in nodes:
-            if n.type == "OUTPUT_MATERIAL" and n.is_active_output:
-                output_node = n
-                break
-        if output_node is None:
-            output_node = nodes.new("ShaderNodeOutputMaterial")
+        # Resolve the source BEFORE rerouting the output - finding the
+        # rendering BSDF walks up from the active output's Surface.
+        source_socket = _tb_channel_source_socket(mat, channel)
+        fallback = (0.0, 0.0, 0.0, 1.0)
+        if channel == "diffuse":
+            bsdf = _tb_bake_bsdf(mat)
+            if bsdf is not None:
+                fallback = tuple(bsdf.inputs["Base Color"].default_value)
 
+        output_node = _tb_active_output(nodes, create=True)
         emission = nodes.new("ShaderNodeEmission")
         emission.name = "TB_Emission"
+        emission.inputs["Color"].default_value = fallback
         links.new(emission.outputs["Emission"], output_node.inputs["Surface"])
         temp_nodes.append((mat, emission))
 
-        src_image = getattr(mat, ssm_attr)
-        src_color = (0.0, 0.0, 0.0, 1.0)
-        if src_image is None and channel == "diffuse":
-            src_image, fallback_color = _tb_base_color_source(mat)
-            if fallback_color is not None:
-                src_color = fallback_color
-        emission.inputs["Color"].default_value = src_color
+        if source_socket is not None:
+            links.new(source_socket, emission.inputs["Color"])
+            continue
 
+        src_image = getattr(mat, ssm_attr)
         if src_image is not None:
             source_node = nodes.new("ShaderNodeTexImage")
             source_node.name = "TB_Source"
@@ -3847,6 +3904,35 @@ def _tb_add_emit_overrides(obj, channel):
             links.new(source_node.outputs["Color"], emission.inputs["Color"])
             temp_nodes.append((mat, source_node))
 
+    return temp_nodes
+
+
+def _tb_add_normal_fallbacks(obj):
+    """For the NORMAL bake: any material whose rendering BSDF has nothing
+    connected to Normal but does have an ssm_normal_image gets that image
+    temporarily wired in through a Normal Map node, so it isn't baked
+    flat. Materials with a connected Normal are left exactly as they are.
+    Only ever call this on single-user material copies. Returns
+    [(mat, node), ...] for _tb_remove_temp_nodes."""
+
+    temp_nodes = []
+    for mat in {s.material for s in obj.material_slots if s.material}:
+        if not mat.use_nodes or mat.ssm_normal_image is None:
+            continue
+        bsdf = _tb_bake_bsdf(mat)
+        if bsdf is None or bsdf.inputs["Normal"].is_linked:
+            continue
+        nodes = mat.node_tree.nodes
+        tex = nodes.new("ShaderNodeTexImage")
+        tex.name = "TB_NormalSource"
+        tex.image = mat.ssm_normal_image
+        if tex.image.colorspace_settings.name != "Non-Color":
+            tex.image.colorspace_settings.name = "Non-Color"
+        normal_map = nodes.new("ShaderNodeNormalMap")
+        normal_map.name = "TB_NormalMap"
+        mat.node_tree.links.new(tex.outputs["Color"], normal_map.inputs["Color"])
+        mat.node_tree.links.new(normal_map.outputs["Normal"], bsdf.inputs["Normal"])
+        temp_nodes += [(mat, tex), (mat, normal_map)]
     return temp_nodes
 
 
@@ -3860,14 +3946,7 @@ def _tb_add_coverage_overrides(obj):
         if not mat.use_nodes:
             mat.use_nodes = True
         nodes = mat.node_tree.nodes
-
-        output_node = None
-        for n in nodes:
-            if n.type == "OUTPUT_MATERIAL" and n.is_active_output:
-                output_node = n
-                break
-        if output_node is None:
-            output_node = nodes.new("ShaderNodeOutputMaterial")
+        output_node = _tb_active_output(nodes, create=True)
 
         emission = nodes.new("ShaderNodeEmission")
         emission.name = "TB_Coverage"
@@ -3883,10 +3962,12 @@ def _tb_remove_temp_nodes(temp_nodes):
 
 
 def _tb_bake_normal_channel(target_obj, image, margin):
-    """Bake real tangent-space normals through each material's existing,
-    unmodified Normal Map setup - no node overrides needed for this one."""
+    """Bake real tangent-space normals through each material's existing
+    Normal setup (plus _tb_add_normal_fallbacks for materials that only
+    have an unwired ssm_normal_image)."""
 
-    temp_nodes = _tb_add_target_nodes(target_obj, image)
+    temp_nodes = _tb_add_normal_fallbacks(target_obj)
+    temp_nodes += _tb_add_target_nodes(target_obj, image)
 
     bpy.ops.object.bake(
         type="NORMAL",
@@ -3906,9 +3987,9 @@ def _tb_bake_normal_channel(target_obj, image, margin):
 
 
 def _tb_bake_emit_channel(target_obj, image, channel, margin):
-    """Bake a raw texel copy of each material's respective ssm_* source
-    image via a temporary Emission override (see _tb_add_emit_overrides
-    for the Diffuse fallback; anything else with no image bakes black)."""
+    """Bake a raw copy of each material's value for this channel via a
+    temporary Emission override (see _tb_add_emit_overrides for where
+    the value comes from)."""
 
     temp_nodes = _tb_add_emit_overrides(target_obj, channel)
     temp_nodes += _tb_add_target_nodes(target_obj, image)
@@ -4031,6 +4112,7 @@ def _tb_bake_selected_to_active(source_obj, target_obj, channel, image, ray_kwar
 
     temp_nodes = _tb_add_target_nodes(target_obj, image)
     if channel == "normal":
+        temp_nodes += _tb_add_normal_fallbacks(source_obj)
         bpy.ops.object.bake(
             type="NORMAL",
             normal_space="TANGENT",
