@@ -180,7 +180,7 @@ from bpy.types import Operator, Panel, PropertyGroup
 # Keep this in sync with blender_manifest.toml's version every release -
 # shown in the MHO Prepare Viewport panel so it's easy to confirm which
 # build is actually installed (vs. a stale cached zip).
-MHO_ADDON_VERSION = "1.51.0"
+MHO_ADDON_VERSION = "1.51.1"
 
 
 # ---------------------------------------------------------------------
@@ -3749,12 +3749,41 @@ def _tb_add_target_nodes(obj, image):
     return temp_nodes
 
 
+def _tb_base_color_source(mat):
+    """Fallback Diffuse source for a material with no ssm_diffuse_image
+    (e.g. straight out of FBX import): the first Image Texture found
+    upstream of the Principled BSDF's Base Color, else that socket's
+    plain colour value. Returns (image or None, rgba or None)."""
+
+    bsdf = _ssm_find_principled_bsdf(mat.node_tree.nodes)
+    if bsdf is None:
+        return None, None
+    base = bsdf.inputs["Base Color"]
+    if not base.is_linked:
+        return None, tuple(base.default_value)
+
+    stack = [base.links[0].from_node]
+    seen = set()
+    while stack:
+        node = stack.pop()
+        if node.name in seen:
+            continue
+        seen.add(node.name)
+        if node.type == "TEX_IMAGE" and node.image is not None:
+            return node.image, None
+        for inp in node.inputs:
+            stack.extend(link.from_node for link in inp.links)
+    return None, None
+
+
 def _tb_add_emit_overrides(obj, channel):
     """Wire a temporary Emission shader into the active output of every
     material on obj, fed by that material's ssm_* source image for this
-    channel (if it has one). A material with no image for this channel
-    emits nothing, so its region bakes solid black. Only ever call this
-    on single-user material copies - it replaces the Surface link.
+    channel. With no ssm_* image, Diffuse falls back to whatever feeds
+    the Principled Base Color (_tb_base_color_source); anything else
+    emits black. (The Emission node's own default colour is WHITE, so
+    it must always be set explicitly.) Only ever call this on
+    single-user material copies - it replaces the Surface link.
     Returns [(mat, node), ...] for _tb_remove_temp_nodes."""
 
     ssm_attr = _TB_SSM_ATTR[channel]
@@ -3780,6 +3809,13 @@ def _tb_add_emit_overrides(obj, channel):
         temp_nodes.append((mat, emission))
 
         src_image = getattr(mat, ssm_attr)
+        src_color = (0.0, 0.0, 0.0, 1.0)
+        if src_image is None and channel == "diffuse":
+            src_image, fallback_color = _tb_base_color_source(mat)
+            if fallback_color is not None:
+                src_color = fallback_color
+        emission.inputs["Color"].default_value = src_color
+
         if src_image is not None:
             source_node = nodes.new("ShaderNodeTexImage")
             source_node.name = "TB_Source"
@@ -3847,9 +3883,8 @@ def _tb_bake_normal_channel(target_obj, image, margin):
 
 def _tb_bake_emit_channel(target_obj, image, channel, margin):
     """Bake a raw texel copy of each material's respective ssm_* source
-    image (if it has one) via a temporary Emission override. A material
-    with no image for this channel is left untouched, so Cycles emits
-    nothing there and that region bakes solid black."""
+    image via a temporary Emission override (see _tb_add_emit_overrides
+    for the Diffuse fallback; anything else with no image bakes black)."""
 
     temp_nodes = _tb_add_emit_overrides(target_obj, channel)
     temp_nodes += _tb_add_target_nodes(target_obj, image)
