@@ -5,7 +5,7 @@ A single-file Blender extension (`mho_fbx_to_actions/__init__.py` +
 `blender_manifest.toml`) called **"MHO Actions"**, built for a game-modding
 pipeline (Marvel Heroes Omega project, character `drstrange_classicvu`).
 Targets Blender 5.0+, developed/tested on **Blender 5.1**.
-Current version: **1.51.1**. Installed via drag-drop onto Blender or
+Current version: **1.52.0**. Installed via drag-drop onto Blender or
 Get Extensions > Install from Disk.
 
 There is no build step, no external deps, no tests directory — it's one
@@ -75,6 +75,23 @@ to produce the installable package at
     Export Animations.
 11. **Texture Baker** — per-object/per-selected-faces atlas baking,
     smart UV unwrap, Data Transfer projection.
+    - *Bake to Atlas (Reduced)* (1.52.0): same operator as Bake to Atlas
+      with `reduce=True`. The welded duplicate stays as the high-poly
+      bake source; a copy built with `new_from_object` (modifiers baked
+      in) is planar-dissolved (5°, `delimit={"MATERIAL"}`, toggle
+      `tb_reduce_dissolve_flat`) then Decimate-Collapsed to
+      `tb_reduce_quality` × original tris (only if still above target).
+      Atlas UV goes on the low copy (seams computed while it still has
+      per-material slots), then it gets a single temp bake material and
+      all four channels bake selected-to-active high → low. Cage
+      extrusion / max ray distance come from the measured high↔low
+      nearest-surface gap (BVH, world space, both directions). Output
+      `<object>_Reduced_*.png` on `<object>_Reduced_Atlas`.
+    - Emit-channel sources: an `ssm_*` image if set; otherwise Diffuse
+      falls back to whatever feeds the Principled Base Color (FBX-import
+      materials work without Detect) and other channels bake **black**.
+      The Emission node defaults to white - always set its colour (this
+      caused an all-white Diffuse bug before 1.51.1).
     - *Bake Top-Down (Flat)* (1.50.0, reworked 1.51.0): bakes all selected
       meshes together, seen straight down, onto one single-face quad
       fitted to their exact X/Y bounds (Kurt's workflow: import the zone

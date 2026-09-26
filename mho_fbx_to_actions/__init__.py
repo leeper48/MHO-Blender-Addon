@@ -100,7 +100,14 @@ Includes:
      object (named "<object>_D.png" etc.) are saved into a "textures"
      subfolder next to the .blend, and a single merged material is
      assigned to each new "<object>_Atlas" object - the source
-     objects are left untouched. "Bake Top-Down (Flat)" instead bakes
+     objects are left untouched. "Bake to Atlas (Reduced)" does the
+     same on a reduced-polycount copy: flat areas planar-dissolved
+     (optional), then collapsed to the Quality fraction of the
+     original triangles, and every channel is baked high-to-low
+     (selected-to-active) from the original onto it, so the removed
+     detail lands in the Normal map; ray distances come from the
+     measured high/low gap. Saved as "<object>_Reduced_D.png" etc. on
+     a "<object>_Reduced_Atlas" object. "Bake Top-Down (Flat)" instead bakes
      every selected mesh together, as seen straight down from above,
      onto one single-face quad fitted to their X/Y bounds (a ground
      plane): selected-to-active from a quad just above the highest
@@ -180,7 +187,7 @@ from bpy.types import Operator, Panel, PropertyGroup
 # Keep this in sync with blender_manifest.toml's version every release -
 # shown in the MHO Prepare Viewport panel so it's easy to confirm which
 # build is actually installed (vs. a stale cached zip).
-MHO_ADDON_VERSION = "1.51.1"
+MHO_ADDON_VERSION = "1.52.0"
 
 
 # ---------------------------------------------------------------------
@@ -1364,6 +1371,23 @@ class MHO_Props(PropertyGroup):
         description="Resolution of the baked Spec Color atlas",
         items=_TB_SIZE_ITEMS,
         default="2048",
+    )
+    tb_reduce_quality: FloatProperty(
+        name="Quality",
+        description="Reduced bake: target triangle count as a fraction of the original "
+                    "(0.25 = about a quarter of the triangles). The detail removed is "
+                    "baked into the Normal map from the original mesh",
+        min=0.01,
+        max=1.0,
+        default=0.25,
+        subtype="FACTOR",
+    )
+    tb_reduce_dissolve_flat: BoolProperty(
+        name="Dissolve Flat Areas",
+        description="Reduced bake: before collapsing, merge nearly-flat regions (within 5 "
+                    "degrees, not across material boundaries) into larger faces - removes "
+                    "triangles from floors, walls and panels at almost no visual cost",
+        default=True,
     )
     tb_selected_faces_only: BoolProperty(
         name="Selected Faces Only",
@@ -3902,7 +3926,126 @@ def _tb_bake_emit_channel(target_obj, image, channel, margin):
     _tb_remove_temp_nodes(temp_nodes)
 
 
-def texture_bake_run(context, source_objs, props, base_name, output_dir):
+def _tb_triangle_count(mesh):
+    return sum(len(p.vertices) - 2 for p in mesh.polygons)
+
+
+def _tb_make_reduced_copy(context, high_obj, quality, dissolve_flat, log):
+    """Build a low-poly copy of high_obj (same transform, materials and
+    UV layers, modifiers baked in) for a high-to-low bake. Optionally
+    planar-dissolves nearly-flat regions first (5 degrees, never across
+    material boundaries), then - only if still above target - collapses
+    edges down to quality x the original triangle count. Each Decimate
+    modifier is added and applied on its own, so it's always the first
+    (only) modifier when applied."""
+
+    depsgraph = context.evaluated_depsgraph_get()
+    mesh = bpy.data.meshes.new_from_object(
+        high_obj.evaluated_get(depsgraph), preserve_all_data_layers=True, depsgraph=depsgraph
+    )
+    low = bpy.data.objects.new(f"{high_obj.name}_low", mesh)
+    low.matrix_world = high_obj.matrix_world.copy()
+    high_obj.users_collection[0].objects.link(low)
+
+    bpy.ops.object.select_all(action="DESELECT")
+    low.select_set(True)
+    context.view_layer.objects.active = low
+
+    before = _tb_triangle_count(mesh)
+    target = max(12, int(before * quality))
+
+    if dissolve_flat:
+        mod = low.modifiers.new("TB_Planar", "DECIMATE")
+        mod.decimate_type = "DISSOLVE"
+        mod.angle_limit = math.radians(5.0)
+        mod.delimit = {"MATERIAL"}
+        bpy.ops.object.modifier_apply(modifier=mod.name)
+
+    after_planar = _tb_triangle_count(low.data)
+    if after_planar > target:
+        mod = low.modifiers.new("TB_Collapse", "DECIMATE")
+        mod.decimate_type = "COLLAPSE"
+        mod.ratio = target / after_planar
+        bpy.ops.object.modifier_apply(modifier=mod.name)
+
+    after = _tb_triangle_count(low.data)
+    log.append(
+        f"OK    reduced {before} -> {after} tris ({100.0 * after / max(before, 1):.1f}%, "
+        f"target {target}{', flat areas dissolved first' if dissolve_flat else ''})"
+    )
+    return low
+
+
+def _tb_world_bvh(context, obj):
+    """(BVHTree, world-space vertex list) for obj's evaluated mesh."""
+
+    from mathutils.bvhtree import BVHTree
+
+    evaluated = obj.evaluated_get(context.evaluated_depsgraph_get())
+    mesh = evaluated.to_mesh()
+    try:
+        mw = evaluated.matrix_world
+        verts = [mw @ v.co for v in mesh.vertices]
+        polys = [tuple(p.vertices) for p in mesh.polygons]
+    finally:
+        evaluated.to_mesh_clear()
+    return BVHTree.FromPolygons(verts, polys), verts
+
+
+def _tb_cage_settings(context, high_obj, low_obj):
+    """Measure how far the reduced mesh drifted from the original (the
+    largest nearest-surface distance, sampled both ways, in world units)
+    and derive selected-to-active ray settings from it: rays start that
+    far (plus a little) outside the low mesh and may travel the same
+    distance past it inward, so they always reach the original surface
+    without reaching across to unrelated geometry further away.
+    Returns (cage_extrusion, max_ray_distance, measured_distance)."""
+
+    high_bvh, high_verts = _tb_world_bvh(context, high_obj)
+    low_bvh, low_verts = _tb_world_bvh(context, low_obj)
+
+    def max_gap(points, bvh, limit=20000):
+        step = max(1, len(points) // limit)
+        worst = 0.0
+        for co in points[::step]:
+            hit = bvh.find_nearest(co)
+            if hit[0] is not None:
+                worst = max(worst, hit[3])
+        return worst
+
+    gap = max(max_gap(high_verts, low_bvh), max_gap(low_verts, high_bvh))
+
+    lo = [min(v[i] for v in high_verts) for i in range(3)]
+    hi = [max(v[i] for v in high_verts) for i in range(3)]
+    eps = max(math.dist(lo, hi) * 0.001, 1e-4)
+
+    extrusion = gap * 1.1 + eps
+    return extrusion, extrusion * 2.0 + eps, gap
+
+
+def _tb_bake_selected_to_active(source_obj, target_obj, channel, image, ray_kwargs):
+    """One selected-to-active bake pass from source_obj's materials into
+    image on target_obj (both must already be selected, target active).
+    channel "normal" bakes tangent-space normals through the source's
+    real shading; anything else bakes an emit copy of that channel."""
+
+    temp_nodes = _tb_add_target_nodes(target_obj, image)
+    if channel == "normal":
+        bpy.ops.object.bake(
+            type="NORMAL",
+            normal_space="TANGENT",
+            normal_r="POS_X",
+            normal_g="POS_Y",
+            normal_b="POS_Z",
+            **ray_kwargs,
+        )
+    else:
+        temp_nodes += _tb_add_emit_overrides(source_obj, channel)
+        bpy.ops.object.bake(type="EMIT", **ray_kwargs)
+    _tb_remove_temp_nodes(temp_nodes)
+
+
+def texture_bake_run(context, source_objs, props, base_name, output_dir, reduce=False):
     """Full pipeline for one atlas: duplicate (and join, if source_objs
     has more than one entry - the caller currently always passes a
     single-object list, one call per selected mesh), build an atlas UV,
@@ -3910,7 +4053,15 @@ def texture_bake_run(context, source_objs, props, base_name, output_dir):
     fresh merged material (built via the same apply_shader_slot_maps
     logic Shader Slot Maps uses everywhere else). Returns (target_obj,
     saved_paths, log), or raises RuntimeError with a user-facing
-    message on failure."""
+    message on failure.
+
+    With reduce=True it's a high-to-low bake instead: the welded
+    duplicate stays as the untouched high-poly bake source, a reduced
+    copy of it (_tb_make_reduced_copy, props.tb_reduce_*) gets the
+    atlas UV, and every channel bakes selected-to-active from high onto
+    low - so the detail removed by the reduction lands in the Normal
+    map. Ray distances come from the measured high/low gap
+    (_tb_cage_settings). The high duplicate is deleted afterwards."""
 
     log = []
     margin = 8
@@ -3935,46 +4086,98 @@ def texture_bake_run(context, source_objs, props, base_name, output_dir):
     bpy.ops.mesh.remove_doubles(threshold=props.mp_merge_distance)
     bpy.ops.object.mode_set(mode="OBJECT")
 
-    _tb_build_atlas_uv(context, target_obj, margin=0.02)
-    _tb_make_single_user_materials(target_obj)
+    high_obj = None
+    bake_mat = None
+    if reduce:
+        high_obj = target_obj
+        high_obj.name = f"{base_name}_TB_High"
+        # Single-user BEFORE the copy, so the low mesh (which only ever
+        # gets the temporary bake material below) can't share them.
+        _tb_make_single_user_materials(high_obj)
+        try:
+            target_obj = _tb_make_reduced_copy(
+                context, high_obj, props.tb_reduce_quality, props.tb_reduce_dissolve_flat, log
+            )
+        except Exception:
+            _tb_remove_object_and_mesh(high_obj)
+            raise
+        target_obj.name = f"{base_name}_Atlas"
+        target_obj.data.name = f"{base_name}_Atlas"
 
     original_engine = context.scene.render.engine
-    context.scene.render.engine = "CYCLES"
-
-    bpy.ops.object.select_all(action="DESELECT")
-    target_obj.select_set(True)
-    context.view_layer.objects.active = target_obj
-
-    sizes = {
-        "diffuse": int(props.tb_diffuse_size),
-        "normal": int(props.tb_normal_size),
-        "specmask": int(props.tb_specmask_size),
-        "speccolor": int(props.tb_speccolor_size),
-    }
-
-    images = {}
     try:
+        _tb_build_atlas_uv(context, target_obj, margin=0.02)
+
+        if reduce:
+            # With selected-to-active only the target's image node matters,
+            # so one temporary material holds it (the atlas seams above
+            # already used the per-material boundaries).
+            bake_mat = bpy.data.materials.new(name="TB_Reduced_Bake")
+            bake_mat.use_nodes = True
+            target_obj.data.materials.clear()
+            target_obj.data.materials.append(bake_mat)
+            for poly in target_obj.data.polygons:
+                poly.material_index = 0
+
+            extrusion, max_ray, gap = _tb_cage_settings(context, high_obj, target_obj)
+            log.append(f"OK    high/low gap {gap:.4f} -> cage {extrusion:.4f}, max ray {max_ray:.4f}")
+            ray_kwargs = dict(
+                use_selected_to_active=True,
+                use_cage=False,
+                cage_extrusion=extrusion,
+                max_ray_distance=max_ray,
+                margin=margin,
+                margin_type="EXTEND",
+                target="IMAGE_TEXTURES",
+                save_mode="INTERNAL",
+                use_clear=True,
+            )
+        else:
+            _tb_make_single_user_materials(target_obj)
+
+        context.scene.render.engine = "CYCLES"
+
+        bpy.ops.object.select_all(action="DESELECT")
+        target_obj.select_set(True)
+        if reduce:
+            high_obj.select_set(True)
+        context.view_layer.objects.active = target_obj
+
+        sizes = {
+            "diffuse": int(props.tb_diffuse_size),
+            "normal": int(props.tb_normal_size),
+            "specmask": int(props.tb_specmask_size),
+            "speccolor": int(props.tb_speccolor_size),
+        }
+
+        images = {}
         # Normal first - it needs each material's real, unmodified
         # Normal Map setup still in place before the raw-copy channels
         # below start overriding material outputs.
-        size = sizes["normal"]
-        img = _tb_new_atlas_image(f"{base_name}_{_TB_LABEL['normal']}", size, "normal")
-        _tb_bake_normal_channel(target_obj, img, margin)
-        images["normal"] = img
-        log.append(f"OK    baked Normal at {size}x{size}")
-
-        for channel in ("diffuse", "specmask", "speccolor"):
+        for channel in ("normal", "diffuse", "specmask", "speccolor"):
             size = sizes[channel]
             img = _tb_new_atlas_image(f"{base_name}_{_TB_LABEL[channel]}", size, channel)
-            _tb_bake_emit_channel(target_obj, img, channel, margin)
+            if reduce:
+                _tb_bake_selected_to_active(high_obj, target_obj, channel, img, ray_kwargs)
+            elif channel == "normal":
+                _tb_bake_normal_channel(target_obj, img, margin)
+            else:
+                _tb_bake_emit_channel(target_obj, img, channel, margin)
             images[channel] = img
             log.append(f"OK    baked {_TB_LABEL[channel]} at {size}x{size}")
     finally:
         context.scene.render.engine = original_engine
+        if high_obj is not None:
+            _tb_remove_object_and_mesh(high_obj)
+        if bake_mat is not None:
+            target_obj.data.materials.clear()
+            bpy.data.materials.remove(bake_mat)
 
     saved_paths = []
     for channel, img in images.items():
-        path = os.path.join(output_dir, img.name + ".png")
+        # Build the filename from the intended name, not img.name - if an
+        # image of that name already exists, Blender suffixes ".001".
+        path = os.path.join(output_dir, f"{base_name}_{_TB_LABEL[channel]}.png")
         img.filepath_raw = path
         img.file_format = "PNG"
         img.save()
@@ -4185,31 +4388,13 @@ def texture_bake_top_down_run(context, source_objs, props, base_name, output_dir
 
         # Normal first, while the sources' real Normal Map setups are
         # still intact (the emit passes below override their outputs).
-        w, h = dims["normal"]
-        img = _tb_new_atlas_image(f"{base_name}_{_TB_LABEL['normal']}", w, "normal", height=h)
-        temp_nodes = _tb_add_target_nodes(plane, img)
-        bpy.ops.object.bake(
-            type="NORMAL",
-            normal_space="TANGENT",
-            normal_r="POS_X",
-            normal_g="POS_Y",
-            normal_b="POS_Z",
-            **ray_kwargs,
-        )
-        _tb_remove_temp_nodes(temp_nodes)
-        images["normal"] = img
-        log.append(f"OK    baked top-down Normal at {w}x{h}")
-
-        for channel in ("diffuse", "specmask", "speccolor"):
+        for channel in ("normal", "diffuse", "specmask", "speccolor"):
             w, h = dims[channel]
             img = _tb_new_atlas_image(
                 f"{base_name}_{_TB_LABEL[channel]}", w, channel, height=h,
                 alpha=(channel == "diffuse"),
             )
-            temp_nodes = _tb_add_emit_overrides(source_dup, channel)
-            temp_nodes += _tb_add_target_nodes(plane, img)
-            bpy.ops.object.bake(type="EMIT", **ray_kwargs)
-            _tb_remove_temp_nodes(temp_nodes)
+            _tb_bake_selected_to_active(source_dup, plane, channel, img, ray_kwargs)
             images[channel] = img
             log.append(f"OK    baked top-down {_TB_LABEL[channel]} at {w}x{h}")
 
@@ -4295,6 +4480,26 @@ class MHO_OT_texture_bake(Operator):
     )
     bl_options = {"REGISTER", "UNDO"}
 
+    reduce: BoolProperty(
+        name="Reduce Polycount",
+        description="High-to-low bake onto a reduced copy (see the Quality slider)",
+        default=False,
+        options={"SKIP_SAVE"},
+    )
+
+    @classmethod
+    def description(cls, context, properties):
+        if properties.reduce:
+            return (
+                "For each selected mesh object separately: make a reduced-polycount copy "
+                "(flat areas dissolved, then collapsed to the Quality fraction of the original "
+                "triangles), build a fresh UV atlas on it, and bake Diffuse/Normal/Spec Mask/"
+                "Spec Color from the ORIGINAL mesh onto it - removed detail goes into the Normal "
+                "map. PNGs go in a 'textures' subfolder next to this .blend as "
+                "<object>_Reduced_D.png etc. - the originals are left untouched"
+            )
+        return cls.bl_description
+
     @classmethod
     def poll(cls, context):
         return bool(bpy.data.filepath) and any(
@@ -4305,6 +4510,9 @@ class MHO_OT_texture_bake(Operator):
         if not bpy.data.filepath:
             self.report({"ERROR"}, "Save this .blend file first - the atlas PNGs export next to it")
             return {"CANCELLED"}
+
+        if context.mode != "OBJECT":
+            bpy.ops.object.mode_set(mode="OBJECT")
 
         source_objs = [o for o in context.selected_objects if o.type == "MESH"]
         if not source_objs:
@@ -4321,8 +4529,9 @@ class MHO_OT_texture_bake(Operator):
 
         for obj in source_objs:
             try:
+                base_name = f"{obj.name}_Reduced" if self.reduce else obj.name
                 target_obj, saved_paths, log = texture_bake_run(
-                    context, [obj], props, obj.name, output_dir
+                    context, [obj], props, base_name, output_dir, reduce=self.reduce
                 )
             except RuntimeError as exc:
                 errors.append(f"{obj.name}: {exc}")
@@ -4765,6 +4974,14 @@ class MHO_PT_texture_bake_panel(Panel):
             layout.label(text=f"Saves to: {_TB_OUTPUT_SUBFOLDER}/", icon="EXPORT")
 
         layout.operator("mho.texture_bake", icon="RENDER_STILL")
+
+        box = layout.box()
+        col = box.column(align=True)
+        col.prop(props, "tb_reduce_quality", slider=True)
+        col.prop(props, "tb_reduce_dissolve_flat")
+        op = box.operator("mho.texture_bake", text="Bake to Atlas (Reduced)", icon="MOD_DECIM")
+        op.reduce = True
+
         layout.operator("mho.texture_bake_top_down", icon="VIEW_ORTHO")
 
 
