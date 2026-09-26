@@ -5,7 +5,7 @@ A single-file Blender extension (`mho_fbx_to_actions/__init__.py` +
 `blender_manifest.toml`) called **"MHO Actions"**, built for a game-modding
 pipeline (Marvel Heroes Omega project, character `drstrange_classicvu`).
 Targets Blender 5.0+, developed/tested on **Blender 5.1**.
-Current version: **1.49.1**. Installed via drag-drop onto Blender or
+Current version: **1.50.0**. Installed via drag-drop onto Blender or
 Get Extensions > Install from Disk.
 
 There is no build step, no external deps, no tests directory — it's one
@@ -75,6 +75,15 @@ to produce the installable package at
     Export Animations.
 11. **Texture Baker** — per-object/per-selected-faces atlas baking,
     smart UV unwrap, Data Transfer projection.
+    - *Bake Top-Down (Flat)* (1.50.0): bakes all selected meshes together,
+      seen straight down, onto one flat square quad (a ground-plane
+      texture for the MHO-UPK-Tools `--ground-box` planes). Selected-to-
+      active from a quad just above the top, zero cage extrusion, so rays
+      go straight down (-Z). Same four channels/sizes as the atlas bake,
+      saved as `<active>_TopDown_D.png` etc. The quad ends at the lowest
+      point with the merged material; custom props `mho_top_down_min_xy`
+      / `_max_xy` / `_z_range` record the covered area (UV 0,0 = min X/Y
+      corner, image up = +Y). Misses bake black.
 
 ## Recent changes (this session, chronological)
 - **Batch Export Animations frame-range fix — attempted, then reverted.**
@@ -172,3 +181,15 @@ to produce the installable package at
   end of the file, near their logical siblings.
 - Bump `MHO_ADDON_VERSION` (near the top of `__init__.py`) and
   `version` in `blender_manifest.toml` together, on every change.
+  `python package.py` refuses to build if they disagree.
+- Files are UTF-8 **without a BOM**. Windows PowerShell 5.1's
+  `Set-Content -Encoding utf8` adds one - edit with the Edit tool or
+  Bash `sed` instead.
+- Blender 5.1 is installed at
+  `C:\Program Files\Blender Foundation\Blender 5.1\blender.exe`, so
+  changes can be tested headless: `blender -b --factory-startup
+  --python test.py`, where the script does `sys.path.insert(0,
+  r"C:\Dev\MHO-Blender-Addon")`, imports `mho_fbx_to_actions`, calls
+  `register()` after `wm.read_factory_settings`, and saves the scene to
+  a scratch `.blend` first (the output-writing tools need
+  `bpy.data.filepath`).

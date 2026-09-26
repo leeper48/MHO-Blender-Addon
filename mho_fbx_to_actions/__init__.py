@@ -100,7 +100,14 @@ Includes:
      object (named "<object>_D.png" etc.) are saved into a "textures"
      subfolder next to the .blend, and a single merged material is
      assigned to each new "<object>_Atlas" object - the source
-     objects are left untouched.
+     objects are left untouched. "Bake Top-Down (Flat)" instead bakes
+     every selected mesh together, as seen straight down from above,
+     onto one flat square quad covering their footprint (a ground
+     plane texture): selected-to-active from a quad just above the
+     highest point, rays cast straight down. Same four channels and
+     sizes, saved as "<active>_TopDown_D.png" etc.; the quad ends up
+     at the lowest point with the merged material, and its world X/Y
+     extents are stored as custom properties on it.
   10. Weight Smooth: runs Vertex Group Smooth across every vertex
       group on the active mesh, any time - not tied to a Weight
       Transfer. With "Selected Vertices Only" on, only vertices
@@ -171,7 +178,7 @@ from bpy.types import Operator, Panel, PropertyGroup
 # Keep this in sync with blender_manifest.toml's version every release -
 # shown in the MHO Prepare Viewport panel so it's easy to confirm which
 # build is actually installed (vs. a stale cached zip).
-MHO_ADDON_VERSION = "1.49.1"
+MHO_ADDON_VERSION = "1.50.0"
 
 
 # ---------------------------------------------------------------------
@@ -1208,7 +1215,7 @@ class MHO_Props(PropertyGroup):
 
     # VGroup Mirror Names
     vg_axis_correction_degrees: FloatProperty(
-        name="Axis Correction (Z°)",
+        name="Axis Correction (ZÂ°)",
         default=0.0,
         description="Only needed for Blender's built-in live X-Mirror painting, which turned "
                     "out not to work reliably for this rig (see Mirror Weights (Custom) below "
@@ -2718,7 +2725,7 @@ class MHO_OT_model_prep_scale_rotate(Operator):
 
         self.report(
             {"INFO"},
-            f"Scaled x{scale_factor} and rotated {rotate_z_degrees}° on "
+            f"Scaled x{scale_factor} and rotated {rotate_z_degrees}Â° on "
             f"{len(mesh_objs)} mesh(es). Select which parts to join next.",
         )
         return {"FINISHED"}
@@ -3717,12 +3724,13 @@ def _tb_new_atlas_image(name, size, channel):
     return img
 
 
-def _tb_bake_normal_channel(target_obj, image, margin):
-    """Bake real tangent-space normals through each material's existing,
-    unmodified Normal Map setup - no node overrides needed for this one."""
+def _tb_add_target_nodes(obj, image):
+    """Add a temporary, active 'TB_Target' Image Texture node pointing at
+    image to every material on obj - this is where Cycles writes the
+    bake. Returns [(mat, node), ...] for _tb_remove_temp_nodes."""
 
     temp_nodes = []
-    for mat in {s.material for s in target_obj.material_slots if s.material}:
+    for mat in {s.material for s in obj.material_slots if s.material}:
         if not mat.use_nodes:
             mat.use_nodes = True
         nodes = mat.node_tree.nodes
@@ -3734,35 +3742,21 @@ def _tb_bake_normal_channel(target_obj, image, margin):
         target_node.select = True
         nodes.active = target_node
         temp_nodes.append((mat, target_node))
-
-    bpy.ops.object.bake(
-        type="NORMAL",
-        margin=margin,
-        margin_type="EXTEND",
-        use_selected_to_active=False,
-        normal_space="TANGENT",
-        normal_r="POS_X",
-        normal_g="POS_Y",
-        normal_b="POS_Z",
-        target="IMAGE_TEXTURES",
-        save_mode="INTERNAL",
-        use_clear=True,
-    )
-
-    for mat, node in temp_nodes:
-        mat.node_tree.nodes.remove(node)
+    return temp_nodes
 
 
-def _tb_bake_emit_channel(target_obj, image, channel, margin):
-    """Bake a raw texel copy of each material's respective ssm_* source
-    image (if it has one) via a temporary Emission override. A material
-    with no image for this channel is left untouched, so Cycles emits
-    nothing there and that region bakes solid black."""
+def _tb_add_emit_overrides(obj, channel):
+    """Wire a temporary Emission shader into the active output of every
+    material on obj, fed by that material's ssm_* source image for this
+    channel (if it has one). A material with no image for this channel
+    emits nothing, so its region bakes solid black. Only ever call this
+    on single-user material copies - it replaces the Surface link.
+    Returns [(mat, node), ...] for _tb_remove_temp_nodes."""
 
     ssm_attr = _TB_SSM_ATTR[channel]
     temp_nodes = []
 
-    for mat in {s.material for s in target_obj.material_slots if s.material}:
+    for mat in {s.material for s in obj.material_slots if s.material}:
         if not mat.use_nodes:
             mat.use_nodes = True
         nodes = mat.node_tree.nodes
@@ -3779,24 +3773,55 @@ def _tb_bake_emit_channel(target_obj, image, channel, margin):
         emission = nodes.new("ShaderNodeEmission")
         emission.name = "TB_Emission"
         links.new(emission.outputs["Emission"], output_node.inputs["Surface"])
+        temp_nodes.append((mat, emission))
 
         src_image = getattr(mat, ssm_attr)
-        source_node = None
         if src_image is not None:
             source_node = nodes.new("ShaderNodeTexImage")
             source_node.name = "TB_Source"
             source_node.image = src_image
             links.new(source_node.outputs["Color"], emission.inputs["Color"])
+            temp_nodes.append((mat, source_node))
 
-        target_node = nodes.new("ShaderNodeTexImage")
-        target_node.name = "TB_Target"
-        target_node.image = image
-        for n in nodes:
-            n.select = False
-        target_node.select = True
-        nodes.active = target_node
+    return temp_nodes
 
-        temp_nodes.append((mat, emission, source_node, target_node))
+
+def _tb_remove_temp_nodes(temp_nodes):
+    for mat, node in temp_nodes:
+        mat.node_tree.nodes.remove(node)
+
+
+def _tb_bake_normal_channel(target_obj, image, margin):
+    """Bake real tangent-space normals through each material's existing,
+    unmodified Normal Map setup - no node overrides needed for this one."""
+
+    temp_nodes = _tb_add_target_nodes(target_obj, image)
+
+    bpy.ops.object.bake(
+        type="NORMAL",
+        margin=margin,
+        margin_type="EXTEND",
+        use_selected_to_active=False,
+        normal_space="TANGENT",
+        normal_r="POS_X",
+        normal_g="POS_Y",
+        normal_b="POS_Z",
+        target="IMAGE_TEXTURES",
+        save_mode="INTERNAL",
+        use_clear=True,
+    )
+
+    _tb_remove_temp_nodes(temp_nodes)
+
+
+def _tb_bake_emit_channel(target_obj, image, channel, margin):
+    """Bake a raw texel copy of each material's respective ssm_* source
+    image (if it has one) via a temporary Emission override. A material
+    with no image for this channel is left untouched, so Cycles emits
+    nothing there and that region bakes solid black."""
+
+    temp_nodes = _tb_add_emit_overrides(target_obj, channel)
+    temp_nodes += _tb_add_target_nodes(target_obj, image)
 
     bpy.ops.object.bake(
         type="EMIT",
@@ -3808,12 +3833,7 @@ def _tb_bake_emit_channel(target_obj, image, channel, margin):
         use_clear=True,
     )
 
-    for mat, emission, source_node, target_node in temp_nodes:
-        nodes = mat.node_tree.nodes
-        nodes.remove(emission)
-        if source_node is not None:
-            nodes.remove(source_node)
-        nodes.remove(target_node)
+    _tb_remove_temp_nodes(temp_nodes)
 
 
 def texture_bake_run(context, source_objs, props, base_name, output_dir):
@@ -3927,6 +3947,206 @@ def texture_bake_run(context, source_objs, props, base_name, output_dir):
     return target_obj, saved_paths, log
 
 
+def _tb_remove_object_and_mesh(obj):
+    mesh = obj.data
+    bpy.data.objects.remove(obj, do_unlink=True)
+    if mesh is not None and mesh.users == 0:
+        bpy.data.meshes.remove(mesh)
+
+
+def _tb_world_bounds(context, obj):
+    """World-space (min, max) corners of obj's evaluated bounding box."""
+
+    from mathutils import Vector
+
+    evaluated = obj.evaluated_get(context.evaluated_depsgraph_get())
+    corners = [evaluated.matrix_world @ Vector(c) for c in evaluated.bound_box]
+    lo = Vector((min(c.x for c in corners), min(c.y for c in corners), min(c.z for c in corners)))
+    hi = Vector((max(c.x for c in corners), max(c.y for c in corners), max(c.z for c in corners)))
+    return lo, hi
+
+
+def _tb_new_top_down_plane(name, center_x, center_y, z, side, collection):
+    """A single square quad, normal +Z, centred on (center_x, center_y) at
+    height z, with UV (0,0) at its min-X/min-Y corner and (1,1) at its
+    max-X/max-Y corner - so the baked image reads as a plain top-down
+    map (image up = world +Y)."""
+
+    half = side / 2.0
+    mesh = bpy.data.meshes.new(name)
+    mesh.from_pydata(
+        [(-half, -half, 0.0), (half, -half, 0.0), (half, half, 0.0), (-half, half, 0.0)],
+        [],
+        [(0, 1, 2, 3)],
+    )
+    uv_layer = mesh.uv_layers.new(name="UVMap")
+    for loop, uv in zip(mesh.loops, ((0, 0), (1, 0), (1, 1), (0, 1))):
+        uv_layer.data[loop.index].uv = uv
+    mesh.update()
+
+    obj = bpy.data.objects.new(name, mesh)
+    obj.location = (center_x, center_y, z)
+    collection.objects.link(obj)
+    return obj
+
+
+def texture_bake_top_down_run(context, source_objs, props, base_name, output_dir):
+    """Orthographic top-down bake of every source mesh together onto one
+    flat square quad - for a ground plane standing in for a whole area.
+
+    The sources are duplicated and joined (optionally trimmed to their
+    selected faces), and their materials made single-user, exactly as
+    the atlas bake does. A square quad covering the joined footprint
+    (the longer of its X/Y extents, centred) is placed just above the
+    highest point, and Cycles bakes selected-to-active from it: with
+    zero cage extrusion, each ray starts on the quad and travels
+    straight down (-Z), so every texel records the first surface it
+    hits from above. Rays that hit nothing leave black, filled in at
+    the edges by the bake margin.
+
+    Afterwards the quad drops to the lowest point of the sources, gets
+    one merged material (via apply_shader_slot_maps), and records its
+    world X/Y extents as custom properties; the joined duplicate is
+    deleted. Returns (plane_obj, saved_paths, log), or raises
+    RuntimeError with a user-facing message on failure."""
+
+    log = []
+    margin = 8
+
+    source_dup = _tb_duplicate_and_join(context, source_objs, props.tb_selected_faces_only)
+    if source_dup is None or len(source_dup.data.polygons) == 0:
+        if source_dup is not None:
+            _tb_remove_object_and_mesh(source_dup)
+        raise RuntimeError("No faces to bake (nothing selected on the source meshes?)")
+
+    plane = None
+    bake_mat = None
+    original_engine = context.scene.render.engine
+    succeeded = False
+    try:
+        source_uv = source_dup.data.uv_layers.get("MHO_Source")
+        if source_uv is not None:
+            source_uv.active_render = True
+        _tb_make_single_user_materials(source_dup)
+
+        lo, hi = _tb_world_bounds(context, source_dup)
+        side = max(hi.x - lo.x, hi.y - lo.y)
+        if side <= 0.0:
+            raise RuntimeError("Selection has no footprint from above (zero X/Y size)")
+        center_x = (lo.x + hi.x) / 2.0
+        center_y = (lo.y + hi.y) / 2.0
+        height = hi.z - lo.z
+        pad = max(side, height) * 0.01 + 0.001
+
+        plane = _tb_new_top_down_plane(
+            f"{base_name}", center_x, center_y, hi.z + pad, side,
+            source_objs[0].users_collection[0],
+        )
+        # Temporary material only to hold the TB_Target node - with
+        # selected-to-active, the target's own shading is never sampled.
+        bake_mat = bpy.data.materials.new(name="TB_TopDown_Bake")
+        bake_mat.use_nodes = True
+        plane.data.materials.append(bake_mat)
+
+        context.scene.render.engine = "CYCLES"
+        bpy.ops.object.select_all(action="DESELECT")
+        source_dup.select_set(True)
+        plane.select_set(True)
+        context.view_layer.objects.active = plane
+
+        ray_kwargs = dict(
+            use_selected_to_active=True,
+            use_cage=False,
+            cage_extrusion=0.0,
+            max_ray_distance=height + 2.0 * pad,
+            margin=margin,
+            margin_type="EXTEND",
+            target="IMAGE_TEXTURES",
+            save_mode="INTERNAL",
+            use_clear=True,
+        )
+
+        sizes = {
+            "diffuse": int(props.tb_diffuse_size),
+            "normal": int(props.tb_normal_size),
+            "specmask": int(props.tb_specmask_size),
+            "speccolor": int(props.tb_speccolor_size),
+        }
+        images = {}
+
+        # Normal first, while the sources' real Normal Map setups are
+        # still intact (the emit passes below override their outputs).
+        size = sizes["normal"]
+        img = _tb_new_atlas_image(f"{base_name}_{_TB_LABEL['normal']}", size, "normal")
+        temp_nodes = _tb_add_target_nodes(plane, img)
+        bpy.ops.object.bake(
+            type="NORMAL",
+            normal_space="TANGENT",
+            normal_r="POS_X",
+            normal_g="POS_Y",
+            normal_b="POS_Z",
+            **ray_kwargs,
+        )
+        _tb_remove_temp_nodes(temp_nodes)
+        images["normal"] = img
+        log.append(f"OK    baked top-down Normal at {size}x{size}")
+
+        for channel in ("diffuse", "specmask", "speccolor"):
+            size = sizes[channel]
+            img = _tb_new_atlas_image(f"{base_name}_{_TB_LABEL[channel]}", size, channel)
+            temp_nodes = _tb_add_emit_overrides(source_dup, channel)
+            temp_nodes += _tb_add_target_nodes(plane, img)
+            bpy.ops.object.bake(type="EMIT", **ray_kwargs)
+            _tb_remove_temp_nodes(temp_nodes)
+            images[channel] = img
+            log.append(f"OK    baked top-down {_TB_LABEL[channel]} at {size}x{size}")
+
+        succeeded = True
+    finally:
+        context.scene.render.engine = original_engine
+        _tb_remove_object_and_mesh(source_dup)
+        if bake_mat is not None:
+            bpy.data.materials.remove(bake_mat)
+        if not succeeded and plane is not None:
+            _tb_remove_object_and_mesh(plane)
+
+    saved_paths = []
+    for channel, img in images.items():
+        # Build the filename from the intended name, not img.name - if an
+        # image of that name already exists, Blender suffixes ".001".
+        path = os.path.join(output_dir, f"{base_name}_{_TB_LABEL[channel]}.png")
+        img.filepath_raw = path
+        img.file_format = "PNG"
+        img.save()
+        saved_paths.append(path)
+        log.append(f"OK    saved '{path}'")
+
+    merged_mat = bpy.data.materials.new(name=f"{base_name}_Merged")
+    merged_mat.ssm_diffuse_image = images.get("diffuse")
+    merged_mat.ssm_normal_image = images.get("normal")
+    merged_mat.ssm_specular_image = images.get("specmask")
+    merged_mat.ssm_speccolor_image = images.get("speccolor")
+    apply_shader_slot_maps(merged_mat)
+    plane.data.materials.clear()
+    plane.data.materials.append(merged_mat)
+
+    # Sit the finished quad at the bottom of the baked area, like a ground
+    # plane, and record exactly what area the image covers.
+    plane.location.z = lo.z
+    half = side / 2.0
+    plane["mho_top_down_min_xy"] = (center_x - half, center_y - half)
+    plane["mho_top_down_max_xy"] = (center_x + half, center_y + half)
+    plane["mho_top_down_z_range"] = (lo.z, hi.z)
+
+    purge_orphan_data()
+
+    log.append(
+        f"OK    '{plane.name}' covers X {center_x - half:.3f}..{center_x + half:.3f}, "
+        f"Y {center_y - half:.3f}..{center_y + half:.3f} (side {side:.3f}), at Z {lo.z:.3f}"
+    )
+    return plane, saved_paths, log
+
+
 # ---------------------------------------------------------------------
 # Texture Baker: operator
 # ---------------------------------------------------------------------
@@ -4004,8 +4224,78 @@ class MHO_OT_texture_bake(Operator):
         return {"FINISHED"}
 
 
+class MHO_OT_texture_bake_top_down(Operator):
+    """Bake a straight-down orthographic view of all selected meshes
+    together onto one flat square quad - a ground plane texture"""
+
+    bl_idname = "mho.texture_bake_top_down"
+    bl_label = "Bake Top-Down (Flat)"
+    bl_description = (
+        "Bake all selected meshes together as seen straight down from above onto one flat "
+        "square quad covering their footprint: Diffuse/Normal/Spec Mask/Spec Color PNGs go in "
+        "a 'textures' subfolder next to this .blend, and the quad is left at the lowest point "
+        "with the merged material. Its X/Y extents are stored as custom properties - the "
+        "originals are left untouched"
+    )
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        return bool(bpy.data.filepath) and any(
+            o.type == "MESH" for o in context.selected_objects
+        )
+
+    def execute(self, context):
+        if not bpy.data.filepath:
+            self.report({"ERROR"}, "Save this .blend file first - the baked PNGs export next to it")
+            return {"CANCELLED"}
+
+        # Leaving Edit Mode also syncs any face selection back to the mesh,
+        # which "Selected Faces Only" reads.
+        if context.mode != "OBJECT":
+            bpy.ops.object.mode_set(mode="OBJECT")
+
+        source_objs = [o for o in context.selected_objects if o.type == "MESH"]
+        if not source_objs:
+            self.report({"ERROR"}, "No mesh objects selected")
+            return {"CANCELLED"}
+
+        active = context.view_layer.objects.active
+        name_obj = active if active in source_objs else source_objs[0]
+        base_name = f"{name_obj.name}_TopDown"
+
+        props = context.scene.mho_props
+        output_dir = os.path.join(os.path.dirname(bpy.data.filepath), _TB_OUTPUT_SUBFOLDER)
+        os.makedirs(output_dir, exist_ok=True)
+
+        try:
+            plane, saved_paths, log = texture_bake_top_down_run(
+                context, source_objs, props, base_name, output_dir
+            )
+        except RuntimeError as exc:
+            self.report({"ERROR"}, str(exc))
+            return {"CANCELLED"}
+
+        for line in log:
+            print(line)
+
+        bpy.ops.object.select_all(action="DESELECT")
+        plane.select_set(True)
+        context.view_layer.objects.active = plane
+
+        lo_x, lo_y = plane["mho_top_down_min_xy"]
+        hi_x, hi_y = plane["mho_top_down_max_xy"]
+        self.report(
+            {"INFO"},
+            f"Baked '{plane.name}' from {len(source_objs)} object(s), {len(saved_paths)} "
+            f"texture(s) into '{output_dir}' - covers X {lo_x:.3f}..{hi_x:.3f}, "
+            f"Y {lo_y:.3f}..{hi_y:.3f}",
+        )
+        return {"FINISHED"}
+
+
 # ---------------------------------------------------------------------
-# Panel (sidebar UI) — all tools live in the "MHO Actions" tab
+# Panel (sidebar UI) â€” all tools live in the "MHO Actions" tab
 # ---------------------------------------------------------------------
 
 class MHO_PT_fbx_to_actions_panel(Panel):
@@ -4346,6 +4636,7 @@ class MHO_PT_texture_bake_panel(Panel):
             layout.label(text=f"Saves to: {_TB_OUTPUT_SUBFOLDER}/", icon="EXPORT")
 
         layout.operator("mho.texture_bake", icon="RENDER_STILL")
+        layout.operator("mho.texture_bake_top_down", icon="VIEW_ORTHO")
 
 
 # ---------------------------------------------------------------------
@@ -4382,6 +4673,7 @@ classes = (
     MHO_OT_detect_shader_slot_maps,
     MHO_OT_detect_shader_slot_maps_all,
     MHO_OT_texture_bake,
+    MHO_OT_texture_bake_top_down,
     MHO_OT_export_for_game,
     MHO_OT_batch_export_animations,
     MHO_PT_fbx_to_actions_panel,
