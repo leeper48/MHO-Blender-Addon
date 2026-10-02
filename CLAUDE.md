@@ -5,7 +5,7 @@ A single-file Blender extension (`mho_fbx_to_actions/__init__.py` +
 `blender_manifest.toml`) called **"MHO Actions"**, built for a game-modding
 pipeline (Marvel Heroes Omega project, character `drstrange_classicvu`).
 Targets Blender 5.0+, developed/tested on **Blender 5.1**.
-Current version: **1.53.0**. Installed via drag-drop onto Blender or
+Current version: **1.54.0**. Installed via drag-drop onto Blender or
 Get Extensions > Install from Disk.
 
 There is no build step, no external deps, no tests directory — it's one
@@ -27,7 +27,14 @@ to produce the installable package at
 
 ## Panels/tools (in build order)
 1. **FBX to Actions** — batch-import FBX exports, convert to Actions,
-   save to an action library `.blend`.
+   save to an action library `.blend`. Since 1.54.0 there's no output
+   path: it always writes `anim.blend` in the FBX folder (opened and
+   added to if it exists; Allow Duplicate Names is judged against it),
+   and the whole job runs in a separate background Blender
+   (`run_fbx_to_actions_in_background` → `fbx_to_actions_job`, via
+   `bpy.app.binary_path --background --factory-startup --python-expr`,
+   importing this package by path) so the open file never changes -
+   no imported objects, no action-name clashes, no Save As.
 2. **Actions to NLA** — append actions, push to NLA tracks.
    - *Add Root Pose Track*: creates a `Root` track (neutral pose keyed
      at frame 1) if none exists.

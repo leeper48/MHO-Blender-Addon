@@ -7,7 +7,9 @@ Toolset for MHO modding work, packaged as a Blender 5.x Extension
 Includes:
   1. FBX -> Actions: batch-imports animated FBX exports from
      MHModelEditor and converts each into a reusable Action, saved
-     into an "action library" .blend file.
+     into an "action library" file, "anim.blend", in the FBX folder
+     (added to if it already exists). The work runs in a separate
+     background Blender, so the file open in the UI is never changed.
   2. Actions -> NLA: appends every Action from that library .blend
      into the current file and pushes each one down onto a chosen
      armature as its own NLA track/strip. If the armature has no NLA
@@ -187,7 +189,7 @@ from bpy.types import Operator, Panel, PropertyGroup
 # Keep this in sync with blender_manifest.toml's version every release -
 # shown in the MHO Prepare Viewport panel so it's easy to confirm which
 # build is actually installed (vs. a stale cached zip).
-MHO_ADDON_VERSION = "1.53.0"
+MHO_ADDON_VERSION = "1.54.0"
 
 
 # ---------------------------------------------------------------------
@@ -269,6 +271,89 @@ def process_fbx_file(filepath, allow_duplicate_names, log):
 
     log.append(f"OK    {os.path.basename(filepath)}  ->  action '{action.name}'")
     return action
+
+
+# Action library written by FBX -> Actions, always into the FBX folder.
+FBX_ACTIONS_LIBRARY_NAME = "anim.blend"
+
+
+def fbx_to_actions_job(input_dir, out_path, allow_duplicate_names):
+    """Runs INSIDE a separate background Blender (see
+    run_fbx_to_actions_in_background): opens out_path if it already
+    exists (so earlier actions are kept and duplicates are judged
+    against it), otherwise starts from an empty file; imports every FBX
+    in input_dir as an Action; purges the leftover import data; saves
+    out_path. Reports back over stdout as 'MHOLOG <line>' lines and one
+    final 'MHOSUMMARY <json>' line."""
+
+    if os.path.isfile(out_path):
+        bpy.ops.wm.open_mainfile(filepath=out_path)
+    else:
+        bpy.ops.wm.read_factory_settings(use_empty=True)
+
+    log = []
+    created = []
+    skipped = []
+    for filepath in find_fbx_files(input_dir):
+        action = process_fbx_file(filepath, allow_duplicate_names, log)
+        if action is not None:
+            created.append(action.name)
+        else:
+            skipped.append(os.path.basename(filepath))
+
+    bpy.data.orphans_purge(do_recursive=True)
+    bpy.ops.wm.save_as_mainfile(filepath=out_path)
+
+    for line in log:
+        print("MHOLOG " + line)
+    print("MHOSUMMARY " + json.dumps({
+        "created": created,
+        "skipped": skipped,
+        "total_actions": len(bpy.data.actions),
+    }))
+
+
+def run_fbx_to_actions_in_background(input_dir, out_path, allow_duplicate_names):
+    """Run fbx_to_actions_job in a separate, windowless background Blender,
+    so the FBX imports, temporary objects and the Save never touch the
+    file that's open here. Imports this add-on's own module there by
+    path (no add-on registration needed - the job only uses plain
+    functions). Returns (summary dict, log lines); raises RuntimeError
+    with the tail of the child's output if it fails."""
+
+    import subprocess
+
+    package_dir = os.path.dirname(os.path.abspath(__file__))
+    expr = (
+        "import sys, json\n"
+        f"sys.path.insert(0, {os.path.dirname(package_dir)!r})\n"
+        f"import {os.path.basename(package_dir)} as mho\n"
+        f"mho.fbx_to_actions_job({input_dir!r}, {out_path!r}, {bool(allow_duplicate_names)!r})\n"
+    )
+    cmd = [
+        bpy.app.binary_path, "--background", "--factory-startup",
+        "--python-exit-code", "1", "--python-expr", expr,
+    ]
+    result = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+
+    lines = (result.stdout or "").splitlines()
+    log = [line[len("MHOLOG "):] for line in lines if line.startswith("MHOLOG ")]
+    summary = None
+    for line in lines:
+        if line.startswith("MHOSUMMARY "):
+            summary = json.loads(line[len("MHOSUMMARY "):])
+
+    if result.returncode != 0 or summary is None:
+        tail = "\n".join(((result.stdout or "") + (result.stderr or "")).splitlines()[-15:])
+        raise RuntimeError(f"Background Blender failed (exit code {result.returncode}):\n{tail}")
+    return summary, log
 
 
 # ---------------------------------------------------------------------
@@ -1114,14 +1199,10 @@ class MHO_Props(PropertyGroup):
         description="Folder containing the animated FBX files exported from MHModelEditor",
         subtype="DIR_PATH",
     )
-    output_blend: StringProperty(
-        name="Output .blend",
-        description="Where to save the resulting action library (leave blank to skip saving)",
-        subtype="FILE_PATH",
-    )
     allow_duplicate_names: BoolProperty(
         name="Allow Duplicate Names",
-        description="If off, FBX files whose action name already exists in this file are skipped instead of auto-renamed",
+        description="If off, FBX files whose action name already exists in the folder's "
+                    "anim.blend are skipped instead of added with a .001-style suffix",
         default=False,
     )
 
@@ -1404,43 +1485,46 @@ class MHO_Props(PropertyGroup):
 class MHO_OT_import_fbx_to_actions(Operator):
     bl_idname = "mho.import_fbx_to_actions"
     bl_label = "Import FBXs to Actions"
-    bl_description = "Batch-import every FBX in the folder and convert each into an Action"
-    bl_options = {"REGISTER", "UNDO"}
+    bl_description = (
+        "Batch-import every FBX in the folder as an Action and save them into "
+        f"'{FBX_ACTIONS_LIBRARY_NAME}' in that same folder (added to it if it already exists). "
+        "Runs in a separate background Blender - the file open here is not changed"
+    )
+    # Writes a separate file and never touches this one - nothing to undo.
+    bl_options = {"REGISTER"}
 
     def execute(self, context):
         props = context.scene.mho_props
         input_dir = bpy.path.abspath(props.input_dir)
-        output_blend = bpy.path.abspath(props.output_blend) if props.output_blend else None
+        if not input_dir or not os.path.isdir(input_dir):
+            self.report({"ERROR"}, f"FBX folder not found: {input_dir or '(none set)'}")
+            return {"CANCELLED"}
 
         fbx_files = find_fbx_files(input_dir)
         if not fbx_files:
             self.report({"ERROR"}, f"No .fbx files found in: {input_dir}")
             return {"CANCELLED"}
 
-        log = []
-        created = []
-        skipped = []
-
-        for filepath in fbx_files:
-            action = process_fbx_file(filepath, props.allow_duplicate_names, log)
-            if action is not None:
-                created.append(action)
-            else:
-                skipped.append(filepath)
-
-        purge_orphan_data()
+        out_path = os.path.join(input_dir, FBX_ACTIONS_LIBRARY_NAME)
+        try:
+            summary, log = run_fbx_to_actions_in_background(
+                input_dir, out_path, props.allow_duplicate_names
+            )
+        except (OSError, RuntimeError) as exc:
+            print(exc)
+            self.report({"ERROR"}, f"FBX to Actions failed - see the system console. {exc}".splitlines()[0])
+            return {"CANCELLED"}
 
         for line in log:
             print(line)
+        print(f"Saved action library to: {out_path}")
 
-        if output_blend:
-            os.makedirs(os.path.dirname(output_blend), exist_ok=True)
-            bpy.ops.wm.save_as_mainfile(filepath=output_blend)
-            print(f"Saved action library to: {output_blend}")
-
-        msg = f"Created {len(created)} action(s)"
-        if skipped:
-            msg += f", skipped {len(skipped)} (see console)"
+        msg = (
+            f"Created {len(summary['created'])} action(s) in '{out_path}' "
+            f"({summary['total_actions']} total)"
+        )
+        if summary["skipped"]:
+            msg += f", skipped {len(summary['skipped'])} (see console)"
         self.report({"INFO"}, msg)
         return {"FINISHED"}
 
@@ -4730,7 +4814,7 @@ class MHO_PT_fbx_to_actions_panel(Panel):
         props = context.scene.mho_props
 
         layout.prop(props, "input_dir")
-        layout.prop(props, "output_blend")
+        layout.label(text=f"Saves to: <FBX folder>/{FBX_ACTIONS_LIBRARY_NAME}", icon="EXPORT")
         layout.prop(props, "allow_duplicate_names")
         layout.separator()
         layout.operator("mho.import_fbx_to_actions", icon="IMPORT")
