@@ -189,7 +189,7 @@ from bpy.types import Operator, Panel, PropertyGroup
 # Keep this in sync with blender_manifest.toml's version every release -
 # shown in the MHO Prepare Viewport panel so it's easy to confirm which
 # build is actually installed (vs. a stale cached zip).
-MHO_ADDON_VERSION = "1.54.0"
+MHO_ADDON_VERSION = "1.54.1"
 
 
 # ---------------------------------------------------------------------
@@ -1305,7 +1305,7 @@ class MHO_Props(PropertyGroup):
 
     # VGroup Mirror Names
     vg_axis_correction_degrees: FloatProperty(
-        name="Axis Correction (ZÂ°)",
+        name="Axis Correction (Z°)",
         default=0.0,
         description="Only needed for Blender's built-in live X-Mirror painting, which turned "
                     "out not to work reliably for this rig (see Mirror Weights (Custom) below "
@@ -2835,7 +2835,7 @@ class MHO_OT_model_prep_scale_rotate(Operator):
 
         self.report(
             {"INFO"},
-            f"Scaled x{scale_factor} and rotated {rotate_z_degrees}Â° on "
+            f"Scaled x{scale_factor} and rotated {rotate_z_degrees}° on "
             f"{len(mesh_objs)} mesh(es). Select which parts to join next.",
         )
         return {"FINISHED"}
@@ -4799,7 +4799,7 @@ class MHO_OT_texture_bake_top_down(Operator):
 
 
 # ---------------------------------------------------------------------
-# Panel (sidebar UI) â€” all tools live in the "MHO Actions" tab
+# Panel (sidebar UI) — all tools live in the "MHO Actions" tab
 # ---------------------------------------------------------------------
 
 class MHO_PT_fbx_to_actions_panel(Panel):
