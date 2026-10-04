@@ -183,13 +183,13 @@ import re
 import json
 import math
 import datetime
-from bpy.props import StringProperty, BoolProperty, PointerProperty, FloatProperty, IntProperty, EnumProperty
+from bpy.props import StringProperty, BoolProperty, PointerProperty, FloatProperty, FloatVectorProperty, IntProperty, EnumProperty
 from bpy.types import Operator, Panel, PropertyGroup
 
 # Keep this in sync with blender_manifest.toml's version every release -
 # shown in the MHO Prepare Viewport panel so it's easy to confirm which
 # build is actually installed (vs. a stale cached zip).
-MHO_ADDON_VERSION = "1.54.1"
+MHO_ADDON_VERSION = "1.55.0"
 
 
 # ---------------------------------------------------------------------
@@ -4799,6 +4799,490 @@ class MHO_OT_texture_bake_top_down(Operator):
 
 
 # ---------------------------------------------------------------------
+# Proportional Bones (armature Edit Mode): core logic
+# ---------------------------------------------------------------------
+# Blender's proportional editing (O) does nothing to bones. This brings
+# it back for armature Edit Mode: bone heads and tails are treated like
+# mesh vertices - the selected joints move fully, unselected ones within
+# the radius move by the falloff - using the scene's own proportional
+# settings (toggle, falloff, size, Connected Only).
+
+_PB_FALLOFF_ITEMS = [
+    ("SMOOTH", "Smooth", "Smooth falloff"),
+    ("SPHERE", "Sphere", "Spherical falloff"),
+    ("ROOT", "Root", "Root falloff"),
+    ("INVERSE_SQUARE", "Inverse Square", "Inverse Square falloff"),
+    ("SHARP", "Sharp", "Sharp falloff"),
+    ("LINEAR", "Linear", "Linear falloff"),
+    ("CONSTANT", "Constant", "Constant falloff"),
+    ("RANDOM", "Random", "Random falloff"),
+]
+
+
+def _pb_falloff(dist, radius, falloff, seed=0):
+    """Blender's proportional-edit falloff curves (x = 1 - dist / radius)."""
+
+    if dist <= 0.0:
+        return 1.0
+    if radius <= 0.0 or dist >= radius:
+        return 0.0
+    x = 1.0 - dist / radius
+    if falloff == "SMOOTH":
+        return 3.0 * x * x - 2.0 * x * x * x
+    if falloff == "SPHERE":
+        return math.sqrt(max(0.0, 2.0 * x - x * x))
+    if falloff == "ROOT":
+        return math.sqrt(x)
+    if falloff == "INVERSE_SQUARE":
+        return x * (2.0 - x)
+    if falloff == "SHARP":
+        return x * x
+    if falloff == "CONSTANT":
+        return 1.0
+    if falloff == "RANDOM":
+        import random
+        return random.Random(seed).random() * x
+    return x  # LINEAR
+
+
+def _pb_snapshot(arm_obj):
+    """{bone name: (world head, world tail, world z-axis, roll)} for every
+    visible edit bone, plus the bone order used for point indices."""
+
+    mw = arm_obj.matrix_world
+    m3 = mw.to_3x3()
+    snap = {}
+    for b in arm_obj.data.edit_bones:
+        if b.hide:
+            continue
+        snap[b.name] = (mw @ b.head, mw @ b.tail, (m3 @ b.z_axis).normalized(), b.roll)
+    return snap
+
+
+def _pb_selected_points(arm_obj, snap):
+    """Set of (bone name, "head"/"tail") joints that are selected."""
+
+    sel = set()
+    for name in snap:
+        b = arm_obj.data.edit_bones[name]
+        if b.select or b.select_head:
+            sel.add((name, "head"))
+        if b.select or b.select_tail:
+            sel.add((name, "tail"))
+    return sel
+
+
+def _pb_weights(arm_obj, snap, selected, radius, falloff, connected):
+    """{(bone, end): weight}. Selected joints weigh 1. Others use the
+    falloff of their distance to the nearest selected joint - straight
+    line, or with connected=True measured along the bones themselves
+    (bone lengths plus parent-tail to child-head gaps), so falloff only
+    travels through the hierarchy, like mesh Connected Only."""
+
+    keys = [(name, end) for name in snap for end in ("head", "tail")]
+    pos = {(name, "head"): snap[name][0] for name in snap}
+    pos.update({(name, "tail"): snap[name][1] for name in snap})
+    sel_pos = [pos[k] for k in selected]
+
+    if not connected:
+        dist = {}
+        for k in keys:
+            dist[k] = 0.0 if k in selected else min((pos[k] - s).length for s in sel_pos)
+    else:
+        import heapq
+
+        adjacency = {k: [] for k in keys}
+
+        def link(a, b):
+            d = (pos[a] - pos[b]).length
+            adjacency[a].append((b, d))
+            adjacency[b].append((a, d))
+
+        for name in snap:
+            link((name, "head"), (name, "tail"))
+            parent = arm_obj.data.edit_bones[name].parent
+            if parent is not None and parent.name in snap:
+                link((parent.name, "tail"), (name, "head"))
+
+        dist = {k: 0.0 for k in selected}
+        heap = [(0.0, i, k) for i, k in enumerate(selected)]
+        heapq.heapify(heap)
+        counter = len(heap)
+        while heap:
+            d, _, k = heapq.heappop(heap)
+            if d > dist.get(k, math.inf) or d > radius:
+                continue
+            for nb, step in adjacency[k]:
+                nd = d + step
+                if nd < dist.get(nb, math.inf):
+                    dist[nb] = nd
+                    counter += 1
+                    heapq.heappush(heap, (nd, counter, nb))
+
+    return {
+        k: _pb_falloff(dist.get(k, math.inf), radius, falloff, seed=i)
+        for i, k in enumerate(keys)
+    }
+
+
+def _pb_pivot(context, snap, selected):
+    """World-space pivot: the 3D cursor or the selection's bounding-box
+    centre if that's the scene's pivot setting, otherwise the median of
+    the selected joints."""
+
+    from mathutils import Vector
+
+    pivot_mode = context.scene.tool_settings.transform_pivot_point
+    if pivot_mode == "CURSOR":
+        return context.scene.cursor.location.copy()
+    pts = [snap[name][0 if end == "head" else 1] for name, end in selected]
+    if pivot_mode == "BOUNDING_BOX_CENTER":
+        lo = Vector([min(p[i] for p in pts) for i in range(3)])
+        hi = Vector([max(p[i] for p in pts) for i in range(3)])
+        return (lo + hi) / 2.0
+    return sum(pts, Vector()) / len(pts)
+
+
+def _pb_linear(transform_type, value, angle, axis, weight):
+    """3x3 linear part of the transform at a given weight."""
+
+    from mathutils import Matrix, Quaternion, Vector
+
+    if transform_type == "ROTATE":
+        return Quaternion(Vector(axis).normalized(), angle * weight).to_matrix()
+    if transform_type == "SCALE":
+        return Matrix.Diagonal([1.0 + (s - 1.0) * weight for s in value])
+    return Matrix.Identity(3)
+
+
+def _pb_apply(arm_obj, snap, weights, transform_type, value, angle, axis, pivot):
+    """Set every snapshot bone from its ORIGINAL (snapshot) position:
+    joints move by their weight, unaffected bones are restored exactly.
+    Roll follows the bone's transformed z-axis (at the bone's average
+    joint weight), so bones don't twist as their direction changes."""
+
+    from mathutils import Vector
+
+    mwi = arm_obj.matrix_world.inverted()
+    mwi3 = mwi.to_3x3()
+    delta = Vector(value) if transform_type == "TRANSLATE" else Vector()
+    pivot = Vector(pivot)
+    edit_bones = arm_obj.data.edit_bones
+
+    for name, (head, tail, z_axis, roll) in snap.items():
+        b = edit_bones[name]
+        wh = weights.get((name, "head"), 0.0)
+        wt = weights.get((name, "tail"), 0.0)
+        if wh == 0.0 and wt == 0.0:
+            b.head = mwi @ head
+            b.tail = mwi @ tail
+            b.roll = roll
+            continue
+
+        new_head = pivot + _pb_linear(transform_type, value, angle, axis, wh) @ (head - pivot) + delta * wh
+        new_tail = pivot + _pb_linear(transform_type, value, angle, axis, wt) @ (tail - pivot) + delta * wt
+        if (new_tail - new_head).length < 1e-6:
+            # Blender deletes zero-length bones - keep this one as it was.
+            b.head = mwi @ head
+            b.tail = mwi @ tail
+            b.roll = roll
+            continue
+        new_z = _pb_linear(transform_type, value, angle, axis, (wh + wt) / 2.0) @ z_axis
+
+        b.head = mwi @ new_head
+        b.tail = mwi @ new_tail
+        b.align_roll(mwi3 @ new_z)
+
+
+# ---------------------------------------------------------------------
+# Proportional Bones: operator
+# ---------------------------------------------------------------------
+
+class MHO_OT_proportional_bones(Operator):
+    """Move / rotate / scale bone joints in armature Edit Mode with
+    proportional falloff"""
+
+    bl_idname = "mho.proportional_bones"
+    bl_label = "Proportional Bone Transform"
+    bl_description = (
+        "Move, rotate or scale the selected bone joints in Edit Mode with proportional "
+        "falloff: unselected heads/tails within the radius follow by the falloff curve. "
+        "Uses the scene's Proportional Editing falloff, size and Connected Only settings. "
+        "Mouse wheel / Page Up / Page Down change the radius, X/Y/Z lock to a global axis"
+    )
+    bl_options = {"REGISTER", "UNDO", "BLOCKING"}
+
+    transform_type: EnumProperty(
+        name="Type",
+        items=[
+            ("TRANSLATE", "Move", "Move the joints"),
+            ("ROTATE", "Rotate", "Rotate the joints around the pivot"),
+            ("SCALE", "Scale", "Scale the joints from the pivot"),
+        ],
+        default="TRANSLATE",
+    )
+    value: FloatVectorProperty(
+        name="Value",
+        description="Move: world-space offset. Scale: X/Y/Z factors",
+        size=3,
+        default=(0.0, 0.0, 0.0),
+    )
+    angle: FloatProperty(name="Angle", subtype="ANGLE", default=0.0)
+    axis: FloatVectorProperty(
+        name="Axis", description="Rotation axis (world space)", size=3,
+        default=(0.0, 0.0, 1.0), options={"HIDDEN"},
+    )
+    pivot: FloatVectorProperty(name="Pivot", size=3, subtype="TRANSLATION", options={"HIDDEN"})
+    radius: FloatProperty(name="Proportional Size", min=0.00001, default=1.0)
+    falloff: EnumProperty(name="Falloff", items=_PB_FALLOFF_ITEMS, default="SMOOTH")
+    connected: BoolProperty(
+        name="Connected Only",
+        description="Falloff travels only along the bones (through the hierarchy), not "
+                    "across space to unrelated nearby bones",
+        default=False,
+    )
+    force: BoolProperty(
+        description="Run even when Proportional Editing is off (sidebar buttons)",
+        default=False,
+        options={"HIDDEN", "SKIP_SAVE"},
+    )
+
+    @classmethod
+    def poll(cls, context):
+        return context.mode == "EDIT_ARMATURE" and context.edit_object is not None
+
+    # -- shared -------------------------------------------------------
+
+    def _prepare(self, context, use_scene_pivot):
+        arm_obj = context.edit_object
+        snap = _pb_snapshot(arm_obj)
+        selected = _pb_selected_points(arm_obj, snap)
+        if not selected:
+            return None
+        if use_scene_pivot:
+            self.pivot = _pb_pivot(context, snap, selected)
+        return arm_obj, snap, selected
+
+    def _apply(self, arm_obj, snap, selected):
+        weights = _pb_weights(arm_obj, snap, selected, self.radius, self.falloff, self.connected)
+        value = self.value
+        if self.transform_type == "SCALE" and tuple(value) == (0.0, 0.0, 0.0):
+            value = (1.0, 1.0, 1.0)
+        _pb_apply(arm_obj, snap, weights, self.transform_type, value, self.angle, self.axis, self.pivot)
+
+    # -- redo / scripted ---------------------------------------------
+
+    def execute(self, context):
+        prepared = self._prepare(context, use_scene_pivot=False)
+        if prepared is None:
+            self.report({"ERROR"}, "No bone heads/tails selected")
+            return {"CANCELLED"}
+        self._apply(*prepared)
+        return {"FINISHED"}
+
+    # -- interactive --------------------------------------------------
+
+    def invoke(self, context, event):
+        ts = context.scene.tool_settings
+        if not (self.force or ts.use_proportional_edit):
+            # Proportional Editing is off: let G/R/S fall through to
+            # Blender's own transform keymap items.
+            return {"PASS_THROUGH"}
+
+        area = context.area if context.area and context.area.type == "VIEW_3D" else next(
+            (a for a in context.screen.areas if a.type == "VIEW_3D"), None
+        )
+        region = area and next((r for r in area.regions if r.type == "WINDOW"), None)
+        if region is None:
+            self.report({"ERROR"}, "Needs a 3D Viewport")
+            return {"CANCELLED"}
+
+        prepared = self._prepare(context, use_scene_pivot=True)
+        if prepared is None:
+            self.report({"ERROR"}, "No bone heads/tails selected")
+            return {"CANCELLED"}
+        self._arm_obj, self._snap, self._selected = prepared
+
+        self.radius = ts.proportional_size
+        self.falloff = ts.proportional_edit_falloff
+        self.connected = ts.use_proportional_connected
+        self.value = (1.0, 1.0, 1.0) if self.transform_type == "SCALE" else (0.0, 0.0, 0.0)
+        self.angle = 0.0
+
+        self._area = area
+        self._region = region
+        self._rv3d = area.spaces.active.region_3d
+        self._constraint = None
+        self._start = self._mouse(event)
+        self._last_angle = None
+        self._angle_total = 0.0
+
+        self._draw_handle = None
+        try:
+            self._draw_handle = bpy.types.SpaceView3D.draw_handler_add(
+                self._draw_radius, (), "WINDOW", "POST_PIXEL"
+            )
+        except Exception:
+            pass
+
+        context.window_manager.modal_handler_add(self)
+        self._update(context, event)
+        return {"RUNNING_MODAL"}
+
+    def _mouse(self, event):
+        from mathutils import Vector
+        return Vector((event.mouse_x - self._region.x, event.mouse_y - self._region.y))
+
+    def _pivot_2d(self):
+        from bpy_extras.view3d_utils import location_3d_to_region_2d
+        from mathutils import Vector
+        p = location_3d_to_region_2d(self._region, self._rv3d, self.pivot)
+        return p if p is not None else Vector((self._region.width / 2, self._region.height / 2))
+
+    def _update(self, context, event):
+        from bpy_extras.view3d_utils import region_2d_to_location_3d
+        from mathutils import Vector
+
+        mouse = self._mouse(event)
+        axes = {"X": Vector((1, 0, 0)), "Y": Vector((0, 1, 0)), "Z": Vector((0, 0, 1))}
+        axis = axes.get(self._constraint)
+        toward_viewer = (self._rv3d.view_rotation @ Vector((0.0, 0.0, 1.0))).normalized()
+
+        if self.transform_type == "TRANSLATE":
+            a = region_2d_to_location_3d(self._region, self._rv3d, self._start, self.pivot)
+            b = region_2d_to_location_3d(self._region, self._rv3d, mouse, self.pivot)
+            delta = b - a
+            if axis is not None:
+                delta = axis * delta.dot(axis)
+            self.value = delta
+            label = f"Move {delta.x:.4f}, {delta.y:.4f}, {delta.z:.4f}"
+        elif self.transform_type == "ROTATE":
+            v = mouse - self._pivot_2d()
+            if v.length > 1e-3:
+                ang = math.atan2(v.y, v.x)
+                if self._last_angle is not None:
+                    step = ang - self._last_angle
+                    step = (step + math.pi) % (2.0 * math.pi) - math.pi
+                    self._angle_total += step
+                self._last_angle = ang
+            if axis is None:
+                self.axis = toward_viewer
+                self.angle = self._angle_total
+            else:
+                self.axis = axis
+                self.angle = self._angle_total * (1.0 if axis.dot(toward_viewer) >= 0.0 else -1.0)
+            label = f"Rotate {math.degrees(self._angle_total):.2f}°"
+        else:
+            p2d = self._pivot_2d()
+            f = (mouse - p2d).length / max((self._start - p2d).length, 1.0)
+            if axis is None:
+                self.value = (f, f, f)
+            else:
+                self.value = tuple(f if c else 1.0 for c in axis)
+            label = f"Scale {f:.4f}"
+
+        self._apply(self._arm_obj, self._snap, self._selected)
+
+        axis_note = f" along {self._constraint}" if self._constraint else ""
+        connected_note = ", Connected Only" if self.connected else ""
+        self._area.header_text_set(
+            f"Proportional {label}{axis_note}  |  Size {self.radius:.4f} "
+            f"({self.falloff.title().replace('_', ' ')}{connected_note})  |  "
+            "Wheel/PgUp/PgDn: size   X/Y/Z: axis   LMB/Enter: confirm   RMB/Esc: cancel"
+        )
+        self._area.tag_redraw()
+
+    def _draw_radius(self):
+        """Proportional-size circle around the pivot, in screen space."""
+
+        import gpu
+        from gpu_extras.batch import batch_for_shader
+        from bpy_extras.view3d_utils import location_3d_to_region_2d
+        from mathutils import Vector
+
+        if bpy.context.region != self._region:
+            return
+        centre = self._pivot_2d()
+        right = (self._rv3d.view_rotation @ Vector((1.0, 0.0, 0.0))).normalized()
+        edge = location_3d_to_region_2d(self._region, self._rv3d, Vector(self.pivot) + right * self.radius)
+        if edge is None:
+            return
+        r = (edge - centre).length
+        pts = [
+            (centre.x + r * math.cos(t * 2.0 * math.pi / 64), centre.y + r * math.sin(t * 2.0 * math.pi / 64))
+            for t in range(65)
+        ]
+        shader = gpu.shader.from_builtin("UNIFORM_COLOR")
+        batch = batch_for_shader(shader, "LINE_STRIP", {"pos": pts})
+        shader.uniform_float("color", (1.0, 1.0, 1.0, 0.6))
+        gpu.state.blend_set("ALPHA")
+        batch.draw(shader)
+        gpu.state.blend_set("NONE")
+
+    def _finish(self, context):
+        if self._draw_handle is not None:
+            bpy.types.SpaceView3D.draw_handler_remove(self._draw_handle, "WINDOW")
+            self._draw_handle = None
+        self._area.header_text_set(None)
+        self._area.tag_redraw()
+
+    def modal(self, context, event):
+        if event.type in {"MOUSEMOVE", "INBETWEEN_MOUSEMOVE"}:
+            self._update(context, event)
+            return {"RUNNING_MODAL"}
+
+        if event.value == "PRESS":
+            if event.type in {"WHEELUPMOUSE", "PAGE_UP", "NUMPAD_PLUS"}:
+                self.radius *= 1.1
+                self._update(context, event)
+            elif event.type in {"WHEELDOWNMOUSE", "PAGE_DOWN", "NUMPAD_MINUS"}:
+                self.radius = max(self.radius / 1.1, 0.00001)
+                self._update(context, event)
+            elif event.type in {"X", "Y", "Z"}:
+                self._constraint = None if self._constraint == event.type else event.type
+                self._update(context, event)
+            elif event.type in {"LEFTMOUSE", "RET", "NUMPAD_ENTER", "SPACE"}:
+                context.scene.tool_settings.proportional_size = self.radius
+                self._finish(context)
+                return {"FINISHED"}
+            elif event.type in {"RIGHTMOUSE", "ESC"}:
+                _pb_apply(self._arm_obj, self._snap, {}, "TRANSLATE", (0, 0, 0), 0.0, (0, 0, 1), self.pivot)
+                self._finish(context)
+                return {"CANCELLED"}
+
+        return {"RUNNING_MODAL"}
+
+
+# G / R / S (and O to toggle Proportional Editing) in armature Edit Mode.
+# The operator passes the key through to Blender's own transform when
+# Proportional Editing is off, so the keys behave normally then.
+_pb_addon_keymaps = []
+
+
+def _pb_register_keymaps():
+    kc = bpy.context.window_manager.keyconfigs.addon
+    if kc is None:  # background mode
+        return
+    km = kc.keymaps.new(name="Armature", space_type="EMPTY")
+    for key, transform_type in (("G", "TRANSLATE"), ("R", "ROTATE"), ("S", "SCALE")):
+        kmi = km.keymap_items.new(MHO_OT_proportional_bones.bl_idname, key, "PRESS")
+        kmi.properties.transform_type = transform_type
+        _pb_addon_keymaps.append((km, kmi))
+    kmi = km.keymap_items.new("wm.context_toggle", "O", "PRESS")
+    kmi.properties.data_path = "tool_settings.use_proportional_edit"
+    _pb_addon_keymaps.append((km, kmi))
+
+
+def _pb_unregister_keymaps():
+    for km, kmi in _pb_addon_keymaps:
+        try:
+            km.keymap_items.remove(kmi)
+        except (ReferenceError, RuntimeError):
+            pass
+    _pb_addon_keymaps.clear()
+
+
+# ---------------------------------------------------------------------
 # Panel (sidebar UI) — all tools live in the "MHO Actions" tab
 # ---------------------------------------------------------------------
 
@@ -4818,6 +5302,40 @@ class MHO_PT_fbx_to_actions_panel(Panel):
         layout.prop(props, "allow_duplicate_names")
         layout.separator()
         layout.operator("mho.import_fbx_to_actions", icon="IMPORT")
+
+
+class MHO_PT_proportional_bones_panel(Panel):
+    bl_label = "MHO Proportional Bones"
+    bl_idname = "MHO_PT_proportional_bones"
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
+    bl_category = "MHO Actions"
+
+    @classmethod
+    def poll(cls, context):
+        return context.mode == "EDIT_ARMATURE"
+
+    def draw(self, context):
+        layout = self.layout
+        ts = context.scene.tool_settings
+
+        layout.prop(ts, "use_proportional_edit", text="Proportional Editing (O)", toggle=True,
+                    icon="PROP_ON" if ts.use_proportional_edit else "PROP_OFF")
+        col = layout.column(align=True)
+        col.prop(ts, "proportional_edit_falloff", text="Falloff")
+        col.prop(ts, "proportional_size", text="Size")
+        col.prop(ts, "use_proportional_connected", text="Connected Only")
+
+        row = layout.row(align=True)
+        for transform_type, text, icon in (
+            ("TRANSLATE", "Move", "ORIENTATION_GLOBAL"),
+            ("ROTATE", "Rotate", "DRIVER_ROTATIONAL_DIFFERENCE"),
+            ("SCALE", "Scale", "FULLSCREEN_ENTER"),
+        ):
+            op = row.operator("mho.proportional_bones", text=text, icon=icon)
+            op.transform_type = transform_type
+            op.force = True
+        layout.label(text="With it on, G / R / S use it too", icon="INFO")
 
 
 class MHO_PT_actions_to_nla_panel(Panel):
@@ -5186,10 +5704,12 @@ classes = (
     MHO_OT_detect_shader_slot_maps_all,
     MHO_OT_texture_bake,
     MHO_OT_texture_bake_top_down,
+    MHO_OT_proportional_bones,
     MHO_OT_export_for_game,
     MHO_OT_batch_export_animations,
     MHO_PT_fbx_to_actions_panel,
     MHO_PT_actions_to_nla_panel,
+    MHO_PT_proportional_bones_panel,
     MHO_PT_prepare_viewport_panel,
     MHO_PT_weight_transfer_panel,
     MHO_PT_weight_smooth_panel,
@@ -5231,8 +5751,11 @@ def register():
         description="Specular tint color image for this material",
     )
 
+    _pb_register_keymaps()
+
 
 def unregister():
+    _pb_unregister_keymaps()
     del bpy.types.Material.ssm_speccolor_image
     del bpy.types.Material.ssm_specular_image
     del bpy.types.Material.ssm_normal_image

@@ -5,7 +5,7 @@ A single-file Blender extension (`mho_fbx_to_actions/__init__.py` +
 `blender_manifest.toml`) called **"MHO Actions"**, built for a game-modding
 pipeline (Marvel Heroes Omega project, character `drstrange_classicvu`).
 Targets Blender 5.0+, developed/tested on **Blender 5.1**.
-Current version: **1.54.1**. Installed via drag-drop onto Blender or
+Current version: **1.55.0**. Installed via drag-drop onto Blender or
 Get Extensions > Install from Disk.
 
 There is no build step, no external deps, no tests directory — it's one
@@ -53,6 +53,22 @@ to produce the installable package at
      highest unmuted track wins). Each clip's frame range is trimmed to
      its own strip's range before export. All mute states + scene frame
      range restored in a `finally` block.
+2b. **Proportional Bones** (1.55.0, panel shown only in armature Edit
+   Mode): Blender's proportional editing (O) does nothing to bones
+   (verified in 5.1, Edit and Pose Mode), so `MHO_OT_proportional_bones`
+   re-implements it for Edit Mode. Heads/tails are treated like mesh
+   vertices: selected joints weight 1, others by the scene's own
+   `proportional_edit_falloff` / `proportional_size` /
+   `use_proportional_connected` (Connected Only = Dijkstra along bones +
+   parent-tail→child-head gaps). Every update re-applies from a
+   world-space snapshot; roll follows via `align_roll` on the
+   transformed z-axis. Addon keymap in "Armature": G/R/S call it, O
+   toggles proportional - with proportional OFF `invoke` returns
+   PASS_THROUGH so Blender's own transform runs (can't be tested
+   headless: background `INVOKE_DEFAULT` falls back to execute).
+   Redo panel works through `execute` (stored value/angle/axis/pivot).
+   Pose Mode version not built yet (rotations compound down chains -
+   needs its own design).
 3. **Prepare Viewport** — stick display, weight-paint overlay, material
    preview shading. Also hosts **Render Pose Snapshot** (new in 1.49.x,
    see below). Shows `Script Version: X.X.X`.
@@ -223,9 +239,12 @@ to produce the installable package at
 - Bump `MHO_ADDON_VERSION` (near the top of `__init__.py`) and
   `version` in `blender_manifest.toml` together, on every change.
   `python package.py` refuses to build if they disagree.
-- Files are UTF-8 **without a BOM**. Windows PowerShell 5.1's
-  `Set-Content -Encoding utf8` adds one - edit with the Edit tool or
-  Bash `sed` instead.
+- Files are UTF-8 **without a BOM**. Never round-trip them through
+  Windows PowerShell 5.1: `Get-Content` reads BOM-less UTF-8 as
+  Windows-1252 and `Set-Content -Encoding utf8` writes a BOM - together
+  they double-encoded `°`/`—` into `Â°`/`â€”` in 1.50.0 (repaired in
+  1.54.1). Edit with the Edit tool, Bash `sed`, or Python with
+  `encoding="utf-8"`.
 - Blender 5.1 is installed at
   `C:\Program Files\Blender Foundation\Blender 5.1\blender.exe`, so
   changes can be tested headless: `blender -b --factory-startup
