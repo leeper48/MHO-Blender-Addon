@@ -5,7 +5,7 @@ A single-file Blender extension (`mho_fbx_to_actions/__init__.py` +
 `blender_manifest.toml`) called **"MHO Actions"**, built for a game-modding
 pipeline (Marvel Heroes Omega project, character `drstrange_classicvu`).
 Targets Blender 5.0+, developed/tested on **Blender 5.1**.
-Current version: **1.55.0**. Installed via drag-drop onto Blender or
+Current version: **1.55.1**. Installed via drag-drop onto Blender or
 Get Extensions > Install from Disk.
 
 There is no build step, no external deps, no tests directory — it's one
@@ -67,6 +67,12 @@ to produce the installable package at
    PASS_THROUGH so Blender's own transform runs (can't be tested
    headless: background `INVOKE_DEFAULT` falls back to execute).
    Redo panel works through `execute` (stored value/angle/axis/pivot).
+   Axis lock (X/Y/Z) on Move follows the mouse along the axis as drawn
+   on screen (closest point between the mouse ray and the axis line,
+   like Blender's own G X) - 1.55.0 instead kept only the axis part of
+   the view-plane drag, which is zero for an axis pointing into the
+   screen (X in a side view). When the axis faces the viewer (>0.98),
+   vertical mouse movement drives it (up = toward viewer).
    Pose Mode version not built yet (rotations compound down chains -
    needs its own design).
 3. **Prepare Viewport** — stick display, weight-paint overlay, material
@@ -253,3 +259,12 @@ to produce the installable package at
   `register()` after `wm.read_factory_settings`, and saves the scene to
   a scratch `.blend` first (the output-writing tools need
   `bpy.data.filepath`).
+- Interactive (modal / keymap) behaviour can be tested too: run the UI
+  build with `blender --factory-startup --enable-event-simulate
+  --python sim.py`, where a `bpy.app.timers` callback steps through
+  `window.event_simulate(type=..., value=..., x=..., y=...)` calls,
+  logs results to a file, and ends with `wm.quit_blender()` (a Blender
+  window opens briefly). The FIRST simulated round's key press is
+  usually lost - start with a throwaway round. Running the same
+  sequence with Proportional Editing off gives Blender's own
+  transform as a reference.

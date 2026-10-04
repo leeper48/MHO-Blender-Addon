@@ -189,7 +189,7 @@ from bpy.types import Operator, Panel, PropertyGroup
 # Keep this in sync with blender_manifest.toml's version every release -
 # shown in the MHO Prepare Viewport panel so it's easy to confirm which
 # build is actually installed (vs. a stale cached zip).
-MHO_ADDON_VERSION = "1.55.0"
+MHO_ADDON_VERSION = "1.55.1"
 
 
 # ---------------------------------------------------------------------
@@ -5139,6 +5139,44 @@ class MHO_OT_proportional_bones(Operator):
         p = location_3d_to_region_2d(self._region, self._rv3d, self.pivot)
         return p if p is not None else Vector((self._region.width / 2, self._region.height / 2))
 
+    def _axis_param(self, mouse, axis):
+        """Where along the line pivot + t * axis the mouse ray passes
+        closest (t), or None if the ray runs parallel to the line."""
+
+        from bpy_extras.view3d_utils import region_2d_to_origin_3d, region_2d_to_vector_3d
+        from mathutils import Vector, geometry
+
+        pivot = Vector(self.pivot)
+        origin = region_2d_to_origin_3d(self._region, self._rv3d, mouse)
+        direction = region_2d_to_vector_3d(self._region, self._rv3d, mouse)
+        hit = geometry.intersect_line_line(origin, origin + direction, pivot, pivot + axis)
+        if hit is None:
+            return None
+        return (hit[1] - pivot).dot(axis)
+
+    def _distance_along_axis(self, mouse, axis, toward_viewer):
+        """How far to move along a locked world axis, like Blender's own
+        G + X/Y/Z: follow the mouse along the axis as drawn on screen (the
+        point on the axis line nearest the mouse ray). When the axis points
+        (almost) straight at the viewer - e.g. X in a side view - that's
+        undefined, so vertical mouse movement drives it instead."""
+
+        from bpy_extras.view3d_utils import region_2d_to_location_3d
+        from mathutils import Vector
+
+        pivot = Vector(self.pivot)
+        if abs(axis.dot(toward_viewer)) < 0.98:  # axis visibly on screen
+            t0 = self._axis_param(self._start, axis)
+            t1 = self._axis_param(mouse, axis)
+            if t0 is not None and t1 is not None:
+                return t1 - t0
+
+        a = region_2d_to_location_3d(self._region, self._rv3d, self._start, pivot)
+        b = region_2d_to_location_3d(self._region, self._rv3d, self._start + Vector((0.0, 1.0)), pivot)
+        per_pixel = (b - a).length
+        sign = 1.0 if axis.dot(toward_viewer) >= 0.0 else -1.0
+        return (mouse.y - self._start.y) * per_pixel * sign
+
     def _update(self, context, event):
         from bpy_extras.view3d_utils import region_2d_to_location_3d
         from mathutils import Vector
@@ -5149,11 +5187,12 @@ class MHO_OT_proportional_bones(Operator):
         toward_viewer = (self._rv3d.view_rotation @ Vector((0.0, 0.0, 1.0))).normalized()
 
         if self.transform_type == "TRANSLATE":
-            a = region_2d_to_location_3d(self._region, self._rv3d, self._start, self.pivot)
-            b = region_2d_to_location_3d(self._region, self._rv3d, mouse, self.pivot)
-            delta = b - a
-            if axis is not None:
-                delta = axis * delta.dot(axis)
+            if axis is None:
+                a = region_2d_to_location_3d(self._region, self._rv3d, self._start, self.pivot)
+                b = region_2d_to_location_3d(self._region, self._rv3d, mouse, self.pivot)
+                delta = b - a
+            else:
+                delta = axis * self._distance_along_axis(mouse, axis, toward_viewer)
             self.value = delta
             label = f"Move {delta.x:.4f}, {delta.y:.4f}, {delta.z:.4f}"
         elif self.transform_type == "ROTATE":
