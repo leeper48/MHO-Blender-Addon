@@ -189,7 +189,7 @@ from bpy.types import Operator, Panel, PropertyGroup
 # Keep this in sync with blender_manifest.toml's version every release -
 # shown in the MHO Prepare Viewport panel so it's easy to confirm which
 # build is actually installed (vs. a stale cached zip).
-MHO_ADDON_VERSION = "1.55.1"
+MHO_ADDON_VERSION = "1.55.2"
 
 
 # ---------------------------------------------------------------------
