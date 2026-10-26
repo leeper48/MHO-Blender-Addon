@@ -5,7 +5,7 @@ A single-file Blender extension (`mho_fbx_to_actions/__init__.py` +
 `blender_manifest.toml`) called **"MHO Actions"**, built for a game-modding
 pipeline (Marvel Heroes Omega project, character `drstrange_classicvu`).
 Targets Blender 5.0+, developed/tested on **Blender 5.1**.
-Current version: **1.55.2**. Installed via drag-drop onto Blender or
+Current version: **1.56.0**. Installed via drag-drop onto Blender or
 Get Extensions > Install from Disk.
 
 There is no build step, no external deps, no tests directory — it's one
@@ -75,7 +75,8 @@ to produce the installable package at
    vertical mouse movement drives it (up = toward viewer).
    Pose Mode version not built yet (rotations compound down chains -
    needs its own design).
-3. **Prepare Viewport** — stick display, weight-paint overlay, material
+3. **Prepare Viewport** — stick display + In Front (1.56.0, per armature
+   object, same Current Scene Only scope), weight-paint overlay, material
    preview shading. Also hosts **Render Pose Snapshot** (new in 1.49.x,
    see below). Shows `Script Version: X.X.X`.
 4. **Weight Transfer** — source→target transfer, smooth, armature

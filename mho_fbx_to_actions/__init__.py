@@ -36,7 +36,8 @@ Includes:
      Re-running it with a different axis/amount updates the same
      track/action in place rather than piling up duplicates.
   3. Prepare Viewport: sets every armature's viewport display type to
-     "Stick", sets the Weight Paint overlay opacity/Zero Weights
+     "Stick" with "In Front" on (bones draw over the mesh), sets the
+     Weight Paint overlay opacity/Zero Weights
      display, and switches the viewport to Material Preview shading,
      in one click.
   4. Weight Transfer: transfers vertex group weights from a source
@@ -189,7 +190,7 @@ from bpy.types import Operator, Panel, PropertyGroup
 # Keep this in sync with blender_manifest.toml's version every release -
 # shown in the MHO Prepare Viewport panel so it's easy to confirm which
 # build is actually installed (vs. a stale cached zip).
-MHO_ADDON_VERSION = "1.55.2"
+MHO_ADDON_VERSION = "1.56.0"
 
 
 # ---------------------------------------------------------------------
@@ -1837,13 +1838,15 @@ class MHO_OT_create_z_offset_track(Operator):
 # ---------------------------------------------------------------------
 
 class MHO_OT_prepare_viewport(Operator):
-    """Set every armature's viewport display type to Stick, set the
-    3D Viewport's Weight Paint overlay opacity/Zero Weights display,
-    and switch the viewport to Material Preview shading"""
+    """Set every armature's viewport display type to Stick and turn on
+    its In Front display, set the 3D Viewport's Weight Paint overlay
+    opacity/Zero Weights display, and switch the viewport to Material
+    Preview shading"""
     bl_idname = "mho.prepare_viewport"
     bl_label = "Prepare Viewport"
     bl_description = (
-        "Set all armatures to Stick display, set the Weight Paint overlay "
+        "Set all armatures to Stick display with In Front on (bones draw over the "
+        "mesh), set the Weight Paint overlay "
         "opacity to 0.8 with Zero Weights display set to Active, and switch "
         "the viewport to Material Preview shading"
     )
@@ -1871,11 +1874,22 @@ class MHO_OT_prepare_viewport(Operator):
                     arm_data.display_type = "STICK"
                     count += 1
 
+        # In Front is per object (Stick is per armature data), same scope.
+        armature_objs = context.scene.objects if scene_only else bpy.data.objects
+        in_front_count = 0
+        for obj in armature_objs:
+            if obj.type == "ARMATURE" and not obj.show_in_front:
+                obj.show_in_front = True
+                in_front_count += 1
+
         set_weight_paint_overlay(context, opacity=0.8, zero_weights="ACTIVE")
         shading_set = set_viewport_shading(context, "MATERIAL")
 
         stick_note = f"{count} armature(s) set to Stick" if count else "armatures already Stick"
-        msg = f"Viewport prepared: {stick_note}, Weight Paint overlay 0.8/Active"
+        front_note = (
+            f"{in_front_count} set to In Front" if in_front_count else "already In Front"
+        )
+        msg = f"Viewport prepared: {stick_note}, {front_note}, Weight Paint overlay 0.8/Active"
         if shading_set:
             msg += ", shading set to Material Preview"
         else:
