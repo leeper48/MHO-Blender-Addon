@@ -5,7 +5,7 @@ A single-file Blender extension (`mho_fbx_to_actions/__init__.py` +
 `blender_manifest.toml`) called **"MHO Actions"**, built for a game-modding
 pipeline (Marvel Heroes Omega project, character `drstrange_classicvu`).
 Targets Blender 5.0+, developed/tested on **Blender 5.1**.
-Current version: **1.56.0**. Installed via drag-drop onto Blender or
+Current version: **1.57.0**. Installed via drag-drop onto Blender or
 Get Extensions > Install from Disk.
 
 There is no build step, no external deps, no tests directory — it's one
@@ -148,6 +148,30 @@ to produce the installable package at
       material (Diffuse alpha wired to BSDF Alpha); custom props
       `mho_top_down_min_xy` / `_max_xy` / `_z_range` record the covered
       area (UV 0,0 = min X/Y corner, image up = +Y).
+
+12. **Threshold Fill** (1.57.0, Texture Paint mode, panel "MHO
+    Threshold Fill", hotkey Shift+Alt+F in the "Image Paint" keymap -
+    checked unused in 5.1): modal eyedropper; LMB raycasts the active
+    object (evaluated, `obj.ray_cast(..., depsgraph=)`), barycentric UV
+    on the hit polygon's loop triangle, seed pixel = UV wrapped mod 1.
+    Image/UV: Material mode = `mat.texture_paint_images[paint_active_slot]`
+    + that slot's `uv_layer` (else active UV); Single Image = `canvas` +
+    active UV. Colour: `image_paint.unified_paint_settings.color` if
+    `use_unified_color` else `image_paint.brush.color` - both
+    scene-LINEAR in 5.1 (subtype COLOR) - converted to sRGB for byte
+    sRGB images, as-is for float/Non-Color. Threshold = Euclidean
+    RGB/RGBA distance (like the Fill brush) or luminance difference.
+    UV islands = faces linked by loops sharing vertex + UV (np.unique
+    keys, min-label propagation); islands / selected faces are
+    rasterized into a mask (big triangles by row spans). Flood fill is
+    fully vectorized over row runs (searchsorted links between adjacent
+    rows + label propagation) - verified against a BFS on 300 random
+    masks. Timing: 4K 0.3 s (island) / 0.7 s (whole image), 8K 1.4 s /
+    3.2 s. No UNDO flag: Blender's undo doesn't capture Python pixel
+    edits (Ctrl+Z leaves the fill alone - checked in the UI), so
+    `_TF_UNDO_STACK` keeps the last 10 fills (box crop + packed mask;
+    uint8 for byte images, which is exact) for "Undo Last Threshold
+    Fill".
 
 ## Recent changes (this session, chronological)
 - **Batch Export Animations frame-range fix — attempted, then reverted.**

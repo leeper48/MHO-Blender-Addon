@@ -173,6 +173,16 @@ Includes:
       for just whichever single group is highlighted in the Vertex
       Groups list. "Clear Console" clears the System Console window
       and brings it to the front (Windows only) between test runs.
+  12. Threshold Fill (Texture Paint mode): Shift+Alt+F (or the button
+      in the "MHO Threshold Fill" panel), then click the model - flood
+      fills the active paint image from the clicked spot with the brush
+      colour, like the Image Editor Fill brush's threshold, but picked
+      in 3D so atlas textures are easy. Options: Threshold, compare by
+      RGB/RGBA/Luminance, 4/8 connectivity, Limit to UV Island (on by
+      default - the fill can't leak into other atlas islands), Respect
+      Face Mask, Expand (px) for antialiased edges, Strength. Ctrl+Z
+      doesn't undo it (Blender's undo can't see Python pixel edits);
+      "Undo Last Threshold Fill" restores the last 10 fills.
 
 USE:
   Open the 3D Viewport sidebar (press N), find the "MHO Actions" tab.
@@ -190,7 +200,7 @@ from bpy.types import Operator, Panel, PropertyGroup
 # Keep this in sync with blender_manifest.toml's version every release -
 # shown in the MHO Prepare Viewport panel so it's easy to confirm which
 # build is actually installed (vs. a stale cached zip).
-MHO_ADDON_VERSION = "1.56.0"
+MHO_ADDON_VERSION = "1.57.0"
 
 
 # ---------------------------------------------------------------------
@@ -1476,6 +1486,56 @@ class MHO_Props(PropertyGroup):
         description="Bake only the currently selected faces of each selected mesh, instead of "
                     "the complete objects",
         default=False,
+    )
+
+    # Threshold Fill (Texture Paint)
+    tf_threshold: FloatProperty(
+        name="Threshold",
+        description="How different a pixel's colour may be from the clicked pixel and still "
+                    "be filled (colour distance, like the Fill brush's Fill Threshold)",
+        min=0.0, max=1.0, default=0.1, subtype="FACTOR",
+    )
+    tf_compare: EnumProperty(
+        name="Compare",
+        description="Which channels the threshold compares",
+        items=[
+            ("RGB", "RGB", "Colour distance over red, green and blue"),
+            ("RGBA", "RGBA", "Colour distance including alpha"),
+            ("LUMINANCE", "Luminance", "Brightness difference only"),
+        ],
+        default="RGB",
+    )
+    tf_connectivity: EnumProperty(
+        name="Connectivity",
+        description="Which neighbouring pixels the fill spreads to",
+        items=[
+            ("4", "4", "Spread to the pixels left, right, above and below"),
+            ("8", "8", "Also spread diagonally"),
+        ],
+        default="4",
+    )
+    tf_limit_island: BoolProperty(
+        name="Limit to UV Island",
+        description="Only fill inside the UV island of the clicked face, so the fill can't "
+                    "leak into neighbouring islands of the atlas",
+        default=True,
+    )
+    tf_respect_face_mask: BoolProperty(
+        name="Respect Face Mask",
+        description="When face selection masking is on, only fill pixels covered by the "
+                    "selected faces' UVs",
+        default=True,
+    )
+    tf_expand: IntProperty(
+        name="Expand (px)",
+        description="Grow the filled area by this many pixels afterwards, to cover "
+                    "antialiased edges",
+        min=0, max=32, default=0,
+    )
+    tf_strength: FloatProperty(
+        name="Strength",
+        description="Mix between the existing pixels (0) and the fill colour (1)",
+        min=0.0, max=1.0, default=1.0, subtype="FACTOR",
     )
 
 
@@ -4813,6 +4873,581 @@ class MHO_OT_texture_bake_top_down(Operator):
 
 
 # ---------------------------------------------------------------------
+# Threshold Fill (Texture Paint, from the 3D Viewport): core logic
+# ---------------------------------------------------------------------
+# The Image Editor's Fill brush has a colour threshold, but finding the
+# right spot on an atlas in 2D is close to impossible. This does the
+# same flood fill started from a click on the model: raycast -> hit
+# triangle -> barycentric UV -> seed pixel -> threshold flood fill on
+# the active paint image, optionally kept inside the clicked UV island
+# and/or the selected faces (face mask). All pixel work is numpy.
+
+_TF_UNDO_STACK = []          # [(image name, (y0, y1, x0, x1), packed region mask, old crop)]
+_TF_UNDO_MAX_STEPS = 10
+_TF_UNDO_MAX_BYTES = 512 * 1024 * 1024
+_TF_LUMA = (0.2126, 0.7152, 0.0722)
+
+
+def _tf_paint_target(context, obj):
+    """(image, UV map name) that texture painting is using on obj -
+    the active paint slot (and its UV map) in Material mode, the canvas
+    in Single Image mode. Raises RuntimeError with a user message."""
+
+    ip = context.scene.tool_settings.image_paint
+    mesh = obj.data
+    if not mesh.uv_layers:
+        raise RuntimeError(f"'{obj.name}' has no UV map")
+
+    if ip.mode == "IMAGE":
+        image = ip.canvas
+        if image is None:
+            raise RuntimeError("No canvas image set (Texture Slots > Single Image)")
+        return image, mesh.uv_layers.active.name
+
+    mat = obj.active_material
+    if mat is None:
+        raise RuntimeError(f"'{obj.name}' has no active material to paint on")
+    idx = mat.paint_active_slot
+    images = mat.texture_paint_images
+    if idx >= len(images) or images[idx] is None:
+        raise RuntimeError(f"Material '{mat.name}' has no active paint texture slot")
+    uv_name = None
+    if idx < len(mat.texture_paint_slots):
+        uv_name = mat.texture_paint_slots[idx].uv_layer or None
+    return images[idx], uv_name or mesh.uv_layers.active.name
+
+
+def _tf_fill_color(context, image):
+    """Current brush colour (unified colour if that's on) as RGBA in the
+    image's own pixel space: brush colours are scene-linear, float images
+    store linear, byte images store their colourspace (sRGB -> sRGB
+    transfer; Non-Color/Linear/Raw -> as is) - the same conversion the
+    Fill brush makes."""
+
+    ip = context.scene.tool_settings.image_paint
+    ups = ip.unified_paint_settings
+    if ups.use_unified_color:
+        rgb = list(ups.color)
+    else:
+        if ip.brush is None:
+            raise RuntimeError("No active brush")
+        rgb = list(ip.brush.color)
+
+    space = image.colorspace_settings.name.lower()
+    if not image.is_float and "srgb" in space and "linear" not in space:
+        rgb = [
+            12.92 * c if c <= 0.0031308 else 1.055 * (c ** (1.0 / 2.4)) - 0.055
+            for c in (max(0.0, c) for c in rgb)
+        ]
+        rgb = [min(1.0, c) for c in rgb]
+    return rgb + [1.0]
+
+
+def _tf_mesh_arrays(mesh, uv_name):
+    """numpy arrays from an (evaluated) mesh: loop-triangle loops (T,3),
+    triangle -> polygon (T,), loop vertices (L,), loop UVs (L,2),
+    loop -> polygon (L,)."""
+
+    import numpy as np
+
+    mesh.calc_loop_triangles()
+    tris = mesh.loop_triangles
+    tri_loops = np.empty(len(tris) * 3, dtype=np.int32)
+    tris.foreach_get("loops", tri_loops)
+    tri_polys = np.empty(len(tris), dtype=np.int32)
+    tris.foreach_get("polygon_index", tri_polys)
+
+    loop_verts = np.empty(len(mesh.loops), dtype=np.int32)
+    mesh.loops.foreach_get("vertex_index", loop_verts)
+    uv_layer = mesh.uv_layers.get(uv_name) or mesh.uv_layers.active
+    uvs = np.empty(len(mesh.loops) * 2, dtype=np.float32)
+    uv_layer.data.foreach_get("uv", uvs)
+
+    starts = np.empty(len(mesh.polygons), dtype=np.int32)
+    totals = np.empty(len(mesh.polygons), dtype=np.int32)
+    mesh.polygons.foreach_get("loop_start", starts)
+    mesh.polygons.foreach_get("loop_total", totals)
+    loop_polys = np.repeat(np.arange(len(mesh.polygons), dtype=np.int32), totals)
+
+    return tri_loops.reshape(-1, 3), tri_polys, loop_verts, uvs.reshape(-1, 2), loop_polys
+
+
+def _tf_hit_uv(mesh, arrays, face_index, hit_local):
+    """UV at hit_local on polygon face_index: barycentric interpolation
+    over whichever of the polygon's triangles contains the point."""
+
+    import numpy as np
+    from mathutils import Vector, geometry
+
+    tri_loops, tri_polys, loop_verts, uvs, _ = arrays
+    best = None
+    for t in np.nonzero(tri_polys == face_index)[0]:
+        loops = tri_loops[t]
+        a, b, c = (mesh.vertices[loop_verts[l]].co for l in loops)
+        # Barycentrics of the point projected into the triangle's plane.
+        v0, v1, v2 = b - a, c - a, hit_local - a
+        d00, d01, d11 = v0.dot(v0), v0.dot(v1), v1.dot(v1)
+        d20, d21 = v2.dot(v0), v2.dot(v1)
+        denom = d00 * d11 - d01 * d01
+        if abs(denom) < 1e-20:
+            continue
+        w1 = (d11 * d20 - d01 * d21) / denom
+        w2 = (d00 * d21 - d01 * d20) / denom
+        w0 = 1.0 - w1 - w2
+        score = min(w0, w1, w2)  # >= 0 means inside; pick the most-inside
+        if best is None or score > best[0]:
+            best = (score, loops, (w0, w1, w2))
+    if best is None:
+        return None
+    _, loops, (w0, w1, w2) = best
+    uv = uvs[loops[0]] * w0 + uvs[loops[1]] * w1 + uvs[loops[2]] * w2
+    return float(uv[0]), float(uv[1])
+
+
+def _tf_island_faces(arrays, face_index):
+    """Boolean per polygon: in the same UV island as face_index. Islands
+    = faces linked through loops that share a vertex AND the same UV
+    (Blender's own UV-island definition), found by min-label
+    propagation with pointer jumping."""
+
+    import numpy as np
+
+    _, _, loop_verts, uvs, loop_polys = arrays
+    q = np.round(uvs * 1e5).astype(np.int64)
+    keys = np.stack([loop_verts.astype(np.int64), q[:, 0], q[:, 1]], axis=1)
+    _, key_id = np.unique(keys, axis=0, return_inverse=True)
+    key_id = key_id.ravel()
+    n_faces = int(loop_polys.max()) + 1 if len(loop_polys) else 0
+
+    label = np.arange(n_faces, dtype=np.int64)
+    while True:
+        key_min = np.full(int(key_id.max()) + 1, n_faces, dtype=np.int64)
+        np.minimum.at(key_min, key_id, label[loop_polys])
+        new = label.copy()
+        np.minimum.at(new, loop_polys, key_min[key_id])
+        new = new[new]  # pointer jumping
+        if np.array_equal(new, label):
+            break
+        label = new
+    return label == label[face_index]
+
+
+def _tf_rasterize(tri_uvs, width, height):
+    """(H, W) bool mask of pixels whose centres fall inside any of the
+    UV triangles (T,3,2). UVs outside 0-1 wrap around the image."""
+
+    import numpy as np
+
+    mask = np.zeros((height, width), dtype=bool)
+    px = tri_uvs * np.array([width, height], dtype=np.float64) - 0.5  # pixel-centre space
+    for (ax, ay), (bx, by), (cx, cy) in px:
+        x0, x1 = int(np.floor(min(ax, bx, cx))), int(np.ceil(max(ax, bx, cx)))
+        y0, y1 = int(np.floor(min(ay, by, cy))), int(np.ceil(max(ay, by, cy)))
+        if x1 - x0 > 4 * width or y1 - y0 > 4 * height:
+            continue  # degenerate / exploded UVs
+        area = (bx - ax) * (cy - ay) - (by - ay) * (cx - ax)
+        if abs(area) < 1e-12:
+            continue
+        sign = 1.0 if area > 0 else -1.0
+
+        if (x1 - x0) * (y1 - y0) > 4096:
+            # Big triangle: per row, the three edges bound x to one span.
+            ys = np.arange(y0, y1 + 1, dtype=np.float64)
+            lo = np.full(ys.shape, -np.inf)
+            hi = np.full(ys.shape, np.inf)
+            empty = np.zeros(ys.shape, dtype=bool)
+            for (px0, py0), (px1, py1) in (((ax, ay), (bx, by)), ((bx, by), (cx, cy)), ((cx, cy), (ax, ay))):
+                # inside: sign * ((px1-px0)*(y-py0) - (py1-py0)*(x-px0)) >= 0
+                k = -(py1 - py0) * sign
+                c = (px1 - px0) * (ys - py0) * sign + (py1 - py0) * px0 * sign
+                if abs(k) < 1e-15:
+                    empty |= c < 0
+                elif k > 0:
+                    lo = np.maximum(lo, -c / k)
+                else:
+                    hi = np.minimum(hi, -c / k)
+            xs_lo = np.ceil(lo - 1e-9).astype(np.int64)
+            xs_hi = np.floor(hi + 1e-9).astype(np.int64)
+            for row, (a, b, skip) in enumerate(zip(xs_lo, xs_hi, empty)):
+                if skip or b < a:
+                    continue
+                yy = (row + y0) % height
+                if b - a + 1 >= width:
+                    mask[yy, :] = True
+                    continue
+                a_w, b_w = a % width, b % width
+                if a_w <= b_w:
+                    mask[yy, a_w:b_w + 1] = True
+                else:  # wraps around the right edge
+                    mask[yy, a_w:] = True
+                    mask[yy, :b_w + 1] = True
+            continue
+
+        xs = np.arange(x0, x1 + 1, dtype=np.float64)
+        ys = np.arange(y0, y1 + 1, dtype=np.float64)[:, None]
+        e0 = ((bx - ax) * (ys - ay) - (by - ay) * (xs - ax)) * sign
+        e1 = ((cx - bx) * (ys - by) - (cy - by) * (xs - bx)) * sign
+        e2 = ((ax - cx) * (ys - cy) - (ay - cy) * (xs - cx)) * sign
+        inside = (e0 >= 0) & (e1 >= 0) & (e2 >= 0)
+        if not inside.any():
+            continue
+        iy, ix = np.nonzero(inside)
+        mask[(iy + y0) % height, (ix + x0) % width] = True
+    return mask
+
+
+def _tf_dilate(mask, steps):
+    """Grow a bool mask by `steps` pixels (8-connected / square)."""
+
+    import numpy as np
+
+    for _ in range(steps):
+        grown = mask.copy()
+        grown[1:, :] |= mask[:-1, :]
+        grown[:-1, :] |= mask[1:, :]
+        grown[:, 1:] |= mask[:, :-1]
+        grown[:, :-1] |= mask[:, 1:]
+        grown[1:, 1:] |= mask[:-1, :-1]
+        grown[1:, :-1] |= mask[:-1, 1:]
+        grown[:-1, 1:] |= mask[1:, :-1]
+        grown[:-1, :-1] |= mask[1:, 1:]
+        mask = grown
+    return mask
+
+
+def _tf_flood(cand, sy, sx, eight):
+    """Connected region of the bool array `cand` containing (sy, sx),
+    4- or 8-connected - fully vectorized (scipy isn't bundled): split
+    every row into runs of True, link runs in neighbouring rows that
+    touch, find connected groups by min-label propagation with pointer
+    jumping, then paint back the seed's group."""
+
+    import numpy as np
+
+    height, width = cand.shape
+    padded = np.zeros((height, width + 2), dtype=np.int8)
+    padded[:, 1:-1] = cand
+    edges = np.diff(padded, axis=1)  # +1 at run start, -1 just past run end
+    sr, sc = np.nonzero(edges == 1)
+    er, ec = np.nonzero(edges == -1)
+    run_row, run_s, run_e = sr.astype(np.int64), sc.astype(np.int64), ec.astype(np.int64) - 1
+    n_runs = len(run_row)
+
+    # Neighbouring-row links: runs in row r+1 whose [s, e] touches [s, e]
+    # of a run in row r (one pixel of slack diagonally for 8-connectivity).
+    slack = 1 if eight else 0
+    stride = width + 4
+    key_s = run_row * stride + run_s
+    key_e = run_row * stride + run_e
+    nxt = run_row + 1
+    lo = np.searchsorted(key_e, nxt * stride + run_s - slack, side="left")
+    hi = np.searchsorted(key_s, nxt * stride + run_e + slack, side="right")
+    counts = np.maximum(hi - lo, 0)
+    ea = np.repeat(np.arange(n_runs), counts)
+    eb = (np.arange(counts.sum()) - np.repeat(np.cumsum(counts) - counts, counts)) + np.repeat(lo, counts)
+
+    label = np.arange(n_runs)
+    while len(ea):
+        new = label.copy()
+        np.minimum.at(new, ea, label[eb])
+        np.minimum.at(new, eb, label[ea])
+        while True:
+            jumped = new[new]
+            if np.array_equal(jumped, new):
+                break
+            new = jumped
+        if np.array_equal(new, label):
+            break
+        label = new
+
+    in_row = np.nonzero(run_row == sy)[0]
+    seed_run = in_row[(run_s[in_row] <= sx) & (run_e[in_row] >= sx)][0]
+    keep = label == label[seed_run]
+
+    flat = np.zeros(height * width + 1, dtype=np.int8)
+    np.add.at(flat, run_row[keep] * width + run_s[keep], 1)
+    np.add.at(flat, run_row[keep] * width + run_e[keep] + 1, -1)
+    return np.cumsum(flat[:-1], dtype=np.int8).astype(bool).reshape(height, width)
+
+
+def threshold_fill(context, obj, ray_origin, ray_direction, settings):
+    """Do one fill from a world-space ray. settings: dict with threshold,
+    compare (RGB/RGBA/LUMINANCE), eight (bool), limit_island,
+    respect_face_mask, expand (px), strength. Returns a summary string;
+    raises RuntimeError with a user message."""
+
+    import numpy as np
+
+    depsgraph = context.evaluated_depsgraph_get()
+    obj_eval = obj.evaluated_get(depsgraph)
+    inv = obj_eval.matrix_world.inverted()
+    origin_local = inv @ ray_origin
+    direction_local = (inv.to_3x3() @ ray_direction).normalized()
+    hit, hit_local, _normal, face_index = obj.ray_cast(origin_local, direction_local, depsgraph=depsgraph)
+    if not hit:
+        raise RuntimeError(f"Click missed '{obj.name}'")
+
+    image, uv_name = _tf_paint_target(context, obj)
+    width, height = image.size
+    if width == 0 or height == 0:
+        raise RuntimeError(f"Image '{image.name}' has no pixel data (missing file?)")
+    fill_rgba = np.array(_tf_fill_color(context, image), dtype=np.float32)
+
+    mesh = obj_eval.to_mesh()
+    try:
+        arrays = _tf_mesh_arrays(mesh, uv_name)
+        uv = _tf_hit_uv(mesh, arrays, face_index, hit_local)
+        if uv is None:
+            raise RuntimeError("Couldn't find the clicked triangle")
+        tri_loops, tri_polys, _, uvs, _ = arrays
+
+        allowed = None
+        if settings["limit_island"]:
+            in_island = _tf_island_faces(arrays, face_index)
+            allowed = _tf_rasterize(uvs[tri_loops[in_island[tri_polys]]], width, height)
+        if settings["respect_face_mask"] and obj.data.use_paint_mask:
+            selected = np.empty(len(mesh.polygons), dtype=bool)
+            mesh.polygons.foreach_get("select", selected)
+            if not selected[face_index]:
+                raise RuntimeError("Clicked face isn't selected (face selection masking is on)")
+            sel_mask = _tf_rasterize(uvs[tri_loops[selected[tri_polys]]], width, height)
+            allowed = sel_mask if allowed is None else (allowed & sel_mask)
+    finally:
+        obj_eval.to_mesh_clear()
+
+    sx = int(np.floor((uv[0] % 1.0) * width)) % width
+    sy = int(np.floor((uv[1] % 1.0) * height)) % height
+    if allowed is not None:
+        allowed[sy, sx] = True  # the clicked pixel always counts
+
+    pixels = np.empty(width * height * 4, dtype=np.float32)
+    image.pixels.foreach_get(pixels)
+    img = pixels.reshape(height, width, 4)
+
+    # Work inside the allowed area's bounding box (+ expand margin).
+    pad = settings["expand"] + 1
+    if allowed is not None:
+        ys = np.nonzero(allowed.any(axis=1))[0]
+        xs = np.nonzero(allowed.any(axis=0))[0]
+        y0, y1 = max(ys[0] - pad, 0), min(ys[-1] + pad + 1, height)
+        x0, x1 = max(xs[0] - pad, 0), min(xs[-1] + pad + 1, width)
+    else:
+        y0, y1, x0, x1 = 0, height, 0, width
+    crop = img[y0:y1, x0:x1]
+    seed = img[sy, sx].copy()
+
+    compare = settings["compare"]
+    if compare == "LUMINANCE":
+        luma = np.array(_TF_LUMA, dtype=np.float32)
+        dist = np.abs(crop[..., :3] @ luma - float(seed[:3] @ luma))
+    else:
+        n = 4 if compare == "RGBA" else 3
+        dist = np.zeros(crop.shape[:2], dtype=np.float32)
+        for ch in range(n):  # channel by channel keeps temporaries small at 8K
+            d = crop[..., ch] - seed[ch]
+            dist += d * d
+        dist = np.sqrt(dist)
+    cand = dist <= settings["threshold"] + 1e-6
+    crop_allowed = None if allowed is None else allowed[y0:y1, x0:x1]
+    if crop_allowed is not None:
+        cand &= crop_allowed
+    cand[sy - y0, sx - x0] = True
+
+    region = _tf_flood(cand, sy - y0, sx - x0, settings["eight"])
+    if settings["expand"] > 0:
+        grown = _tf_dilate(region, settings["expand"])
+        if crop_allowed is not None:
+            grown &= _tf_dilate(crop_allowed, settings["expand"])
+        region = grown
+
+    # Undo copy of the affected box: byte images hold exact k/255 values,
+    # so they're stored as uint8 (a quarter of the memory).
+    ry = np.nonzero(region.any(axis=1))[0]
+    rx = np.nonzero(region.any(axis=0))[0]
+    by0, by1, bx0, bx1 = ry[0], ry[-1] + 1, rx[0], rx[-1] + 1
+    box = crop[by0:by1, bx0:bx1]
+    box_region = region[by0:by1, bx0:bx1]
+    old = np.round(box * 255.0).astype(np.uint8) if not image.is_float else box.copy()
+
+    strength = settings["strength"]
+    new = fill_rgba if strength >= 1.0 else box + (fill_rgba - box) * strength
+    np.copyto(box, new, where=box_region[..., None])
+
+    image.pixels.foreach_set(pixels)
+    image.update()
+
+    _TF_UNDO_STACK.append((
+        image.name,
+        (int(y0 + by0), int(y0 + by1), int(x0 + bx0), int(x0 + bx1)),
+        (np.packbits(box_region), box_region.shape),
+        old,
+    ))
+    while len(_TF_UNDO_STACK) > 1 and (
+        len(_TF_UNDO_STACK) > _TF_UNDO_MAX_STEPS
+        or sum(entry[3].nbytes for entry in _TF_UNDO_STACK) > _TF_UNDO_MAX_BYTES
+    ):
+        _TF_UNDO_STACK.pop(0)
+
+    count = int(box_region.sum())
+    return f"Filled {count:,} px on '{image.name}' (seed px {sx},{sy})"
+
+
+def threshold_fill_undo():
+    """Restore the pixels changed by the most recent threshold fill."""
+
+    import numpy as np
+
+    if not _TF_UNDO_STACK:
+        raise RuntimeError("No threshold fill to undo")
+    name, (y0, y1, x0, x1), (packed, shape), old = _TF_UNDO_STACK.pop()
+    image = bpy.data.images.get(name)
+    if image is None:
+        raise RuntimeError(f"Image '{name}' no longer exists")
+    width, height = image.size
+    if y1 > height or x1 > width:
+        raise RuntimeError(f"Image '{name}' changed size since the fill")
+    region = np.unpackbits(packed, count=shape[0] * shape[1]).astype(bool).reshape(shape)
+    pixels = np.empty(width * height * 4, dtype=np.float32)
+    image.pixels.foreach_get(pixels)
+    box = pixels.reshape(height, width, 4)[y0:y1, x0:x1]
+    restored = old.astype(np.float32) / 255.0 if old.dtype == np.uint8 else old
+    np.copyto(box, restored, where=region[..., None])
+    image.pixels.foreach_set(pixels)
+    image.update()
+    return f"Restored {int(region.sum()):,} px on '{name}'"
+
+
+# ---------------------------------------------------------------------
+# Threshold Fill: operators
+# ---------------------------------------------------------------------
+
+def _tf_settings(context):
+    p = context.scene.mho_props
+    return {
+        "threshold": p.tf_threshold,
+        "compare": p.tf_compare,
+        "eight": p.tf_connectivity == "8",
+        "limit_island": p.tf_limit_island,
+        "respect_face_mask": p.tf_respect_face_mask,
+        "expand": p.tf_expand,
+        "strength": p.tf_strength,
+    }
+
+
+class MHO_OT_threshold_fill(Operator):
+    """Click the model to flood-fill the paint image from that spot"""
+
+    bl_idname = "mho.threshold_fill"
+    bl_label = "Threshold Fill"
+    bl_description = (
+        "Click the model in the 3D Viewport to flood-fill the active paint image from that "
+        "spot with the brush colour: neighbouring pixels within the colour threshold are "
+        "filled, optionally kept inside the clicked UV island / selected faces. Esc or "
+        "right-click cancels. Undo with 'Undo Last Threshold Fill'"
+    )
+    # Image pixel edits from Python aren't captured by Blender's undo, so
+    # no UNDO flag (an undo step would undo nothing and confuse Ctrl+Z);
+    # MHO_OT_threshold_fill_undo restores the stored pixels instead.
+    bl_options = {"REGISTER"}
+
+    ray_origin: FloatVectorProperty(size=3, options={"HIDDEN", "SKIP_SAVE"})
+    ray_direction: FloatVectorProperty(size=3, options={"HIDDEN", "SKIP_SAVE"})
+
+    @classmethod
+    def poll(cls, context):
+        obj = context.active_object
+        return context.mode == "PAINT_TEXTURE" and obj is not None and obj.type == "MESH"
+
+    def execute(self, context):
+        from mathutils import Vector
+
+        if Vector(self.ray_direction).length == 0.0:
+            self.report({"ERROR"}, "No click position (run it from the 3D Viewport)")
+            return {"CANCELLED"}
+        try:
+            msg = threshold_fill(
+                context, context.active_object, Vector(self.ray_origin),
+                Vector(self.ray_direction), _tf_settings(context),
+            )
+        except RuntimeError as exc:
+            self.report({"ERROR"}, str(exc))
+            return {"CANCELLED"}
+        self.report({"INFO"}, msg)
+        return {"FINISHED"}
+
+    def invoke(self, context, event):
+        context.window.cursor_modal_set("EYEDROPPER")
+        context.workspace.status_text_set(
+            "Threshold Fill: click the model to fill  |  Esc / right-click: cancel"
+        )
+        context.window_manager.modal_handler_add(self)
+        return {"RUNNING_MODAL"}
+
+    def _finish(self, context):
+        context.window.cursor_modal_restore()
+        context.workspace.status_text_set(None)
+
+    def modal(self, context, event):
+        from bpy_extras.view3d_utils import region_2d_to_origin_3d, region_2d_to_vector_3d
+
+        if event.type in {"ESC", "RIGHTMOUSE"} and event.value == "PRESS":
+            self._finish(context)
+            return {"CANCELLED"}
+
+        if event.type == "LEFTMOUSE" and event.value == "PRESS":
+            # Find the 3D Viewport region under the mouse (the operator may
+            # have been started from the sidebar button).
+            for area in context.window.screen.areas:
+                if area.type != "VIEW_3D":
+                    continue
+                for region in area.regions:
+                    if region.type != "WINDOW":
+                        continue
+                    if not (region.x <= event.mouse_x < region.x + region.width
+                            and region.y <= event.mouse_y < region.y + region.height):
+                        continue
+                    coord = (event.mouse_x - region.x, event.mouse_y - region.y)
+                    rv3d = area.spaces.active.region_3d
+                    self.ray_origin = region_2d_to_origin_3d(region, rv3d, coord)
+                    self.ray_direction = region_2d_to_vector_3d(region, rv3d, coord)
+                    self._finish(context)
+                    result = self.execute(context)
+                    area.tag_redraw()
+                    return result
+            return {"RUNNING_MODAL"}  # clicked outside a viewport: keep waiting
+
+        # Let navigation (orbit, pan, zoom) through while waiting.
+        return {"PASS_THROUGH"}
+
+
+class MHO_OT_threshold_fill_undo(Operator):
+    """Restore the pixels changed by the last Threshold Fill"""
+
+    bl_idname = "mho.threshold_fill_undo"
+    bl_label = "Undo Last Threshold Fill"
+    bl_description = (
+        "Restore the pixels the most recent Threshold Fill changed (the last 10 fills are "
+        "kept; Ctrl+Z doesn't undo threshold fills)"
+    )
+    bl_options = {"REGISTER"}
+
+    @classmethod
+    def poll(cls, context):
+        return bool(_TF_UNDO_STACK)
+
+    def execute(self, context):
+        try:
+            msg = threshold_fill_undo()
+        except RuntimeError as exc:
+            self.report({"ERROR"}, str(exc))
+            return {"CANCELLED"}
+        for area in context.screen.areas:
+            area.tag_redraw()
+        self.report({"INFO"}, msg)
+        return {"FINISHED"}
+
+
+# ---------------------------------------------------------------------
 # Proportional Bones (armature Edit Mode): core logic
 # ---------------------------------------------------------------------
 # Blender's proportional editing (O) does nothing to bones. This brings
@@ -5325,6 +5960,11 @@ def _pb_register_keymaps():
     kmi.properties.data_path = "tool_settings.use_proportional_edit"
     _pb_addon_keymaps.append((km, kmi))
 
+    # Threshold Fill: Shift+Alt+F in Texture Paint (unused by default).
+    km = kc.keymaps.new(name="Image Paint", space_type="EMPTY")
+    kmi = km.keymap_items.new(MHO_OT_threshold_fill.bl_idname, "F", "PRESS", shift=True, alt=True)
+    _pb_addon_keymaps.append((km, kmi))
+
 
 def _pb_unregister_keymaps():
     for km, kmi in _pb_addon_keymaps:
@@ -5685,6 +6325,37 @@ class MHO_PT_export_for_game_panel(Panel):
         box.operator("mho.batch_export_animations", icon="RENDER_ANIMATION")
 
 
+class MHO_PT_threshold_fill_panel(Panel):
+    bl_label = "MHO Threshold Fill"
+    bl_idname = "MHO_PT_threshold_fill"
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
+    bl_category = "MHO Actions"
+
+    @classmethod
+    def poll(cls, context):
+        return context.mode == "PAINT_TEXTURE"
+
+    def draw(self, context):
+        layout = self.layout
+        props = context.scene.mho_props
+
+        col = layout.column(align=True)
+        col.prop(props, "tf_threshold", slider=True)
+        col.prop(props, "tf_strength", slider=True)
+        layout.prop(props, "tf_compare", expand=True)
+        row = layout.row(align=True)
+        row.label(text="Connectivity")
+        row.prop(props, "tf_connectivity", expand=True)
+        layout.prop(props, "tf_limit_island")
+        layout.prop(props, "tf_respect_face_mask")
+        layout.prop(props, "tf_expand")
+
+        layout.operator("mho.threshold_fill", icon="EYEDROPPER")
+        layout.operator("mho.threshold_fill_undo", icon="LOOP_BACK")
+        layout.label(text="Shift+Alt+F, then click the model", icon="INFO")
+
+
 class MHO_PT_texture_bake_panel(Panel):
     bl_label = "MHO Texture Baker"
     bl_idname = "MHO_PT_texture_bake"
@@ -5758,6 +6429,8 @@ classes = (
     MHO_OT_texture_bake,
     MHO_OT_texture_bake_top_down,
     MHO_OT_proportional_bones,
+    MHO_OT_threshold_fill,
+    MHO_OT_threshold_fill_undo,
     MHO_OT_export_for_game,
     MHO_OT_batch_export_animations,
     MHO_PT_fbx_to_actions_panel,
@@ -5770,6 +6443,7 @@ classes = (
     MHO_PT_model_prep_panel,
     MHO_PT_symmetrical_sculpt_adjust_panel,
     MHO_PT_shader_slot_maps_panel,
+    MHO_PT_threshold_fill_panel,
     MHO_PT_texture_bake_panel,
     MHO_PT_export_for_game_panel,
 )
